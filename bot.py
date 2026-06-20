@@ -251,21 +251,30 @@ async def addproduct_cmd(interaction: discord.Interaction, model: str, price_usd
 # ─────────────────────────────────────────────
 
 async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
+    print(f"[Winsight] Starting grant for discord_id={discord_id}, model={model_name}")
     try:
         async with async_playwright() as p:
+            print("[Winsight] Launching browser...")
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
 
+            print(f"[Winsight] Navigating to {WINSIGHT_URL}")
             await page.goto(WINSIGHT_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
+            print(f"[Winsight] Page loaded, title: {await page.title()}")
 
             login_input = await page.query_selector("input[type='text']")
             if login_input:
+                print("[Winsight] Login form detected, logging in...")
                 await page.fill("input[type='text']", WINSIGHT_USERNAME)
                 await page.fill("input[type='password']", WINSIGHT_PASSWORD)
                 await page.click("button[type='submit']")
                 await page.wait_for_load_state("networkidle", timeout=30000)
+                print(f"[Winsight] Logged in, new title: {await page.title()}")
+            else:
+                print("[Winsight] No login form found (already logged in?)")
 
+            print(f"[Winsight] Searching for model '{model_name}' on page...")
             found = await page.evaluate(f"""
                 () => {{
                     const modelName = "{model_name}".toLowerCase();
@@ -298,9 +307,11 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                     return "not_found";
                 }}
             """)
+            print(f"[Winsight] Search result: {found}")
 
             await asyncio.sleep(2)
             await browser.close()
+            print("[Winsight] Browser closed.")
 
             if found == "clicked":
                 return True, f"Access granted to {discord_id} for {model_name} on Winsight."
@@ -310,18 +321,22 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                 return False, f"Could not find model '{model_name}' on Winsight."
 
     except Exception as e:
+        print(f"[Winsight] EXCEPTION: {str(e)}")
         return False, f"Error: {str(e)}"
 
 
 async def process_paid_order(order_id: str):
+    print(f"[Order] Processing paid order: {order_id}")
     order = get_order(order_id)
     if not order:
         print(f"❌ Order {order_id} not found.")
         return
 
+    print(f"[Order] Order data: {order}")
     update_order(order_id, status="processing")
 
     success, message = await winsight_grant(str(order["buyer_id"]), order["model"])
+    print(f"[Order] winsight_grant result: success={success}, message={message}")
 
     if success:
         update_order(order_id, status="delivered")
@@ -384,8 +399,13 @@ def stripe_webhook():
         metadata = session["metadata"] if "metadata" in session else {}
         order_id = metadata["order_id"] if metadata and "order_id" in metadata else None
 
+        print(f"[Webhook] checkout.session.completed received, order_id={order_id}, main_loop set={main_loop is not None}")
+
         if order_id and main_loop:
             asyncio.run_coroutine_threadsafe(process_paid_order(order_id), main_loop)
+            print(f"[Webhook] Scheduled process_paid_order for {order_id}")
+        else:
+            print(f"[Webhook] NOT scheduled — order_id={order_id}, main_loop={main_loop}")
 
     return jsonify({"status": "ok"}), 200
 
