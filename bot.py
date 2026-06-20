@@ -213,8 +213,6 @@ class OrderStartView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    global main_loop
-    main_loop = asyncio.get_event_loop()
     await tree.sync()
     bot.add_view(OrderStartView())
     print(f"✅ Bot connecté en tant que {bot.user} (ID: {bot.user.id})")
@@ -425,6 +423,10 @@ def run_flask():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    main_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(main_loop)
+
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    bot.run(BOT_TOKEN)
+
+    main_loop.run_until_complete(bot.start(BOT_TOKEN))
