@@ -378,7 +378,11 @@ def stripe_webhook():
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        order_id = session.get("metadata", {}).get("order_id")
+
+        # session peut être un dict classique OU un objet Stripe selon le contexte;
+        # on récupère metadata de façon robuste dans les deux cas.
+        metadata = session["metadata"] if "metadata" in session else {}
+        order_id = metadata["order_id"] if metadata and "order_id" in metadata else None
 
         if order_id and main_loop:
             asyncio.run_coroutine_threadsafe(process_paid_order(order_id), main_loop)
