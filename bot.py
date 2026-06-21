@@ -32,6 +32,11 @@ WINSIGHT_USERNAME = os.environ.get("WINSIGHT_USERNAME", "")
 WINSIGHT_PASSWORD = os.environ.get("WINSIGHT_PASSWORD", "")
 WINSIGHT_URL = os.environ.get("WINSIGHT_URL", "https://winsight.info/px3-8kd4b7e2a1f9")
 
+ENGINEX_USERNAME = os.environ.get("ENGINEX_USERNAME", "")
+ENGINEX_PASSWORD = os.environ.get("ENGINEX_PASSWORD", "")
+ENGINEX_LOGIN_URL = os.environ.get("ENGINEX_LOGIN_URL", "https://enginex-ex.com/auth/signin")
+ENGINEX_ENTITLEMENTS_URL = os.environ.get("ENGINEX_ENTITLEMENTS_URL", "https://enginex-ex.com/entitlements")
+
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
 ORDER_PANEL_CHANNEL_ID = int(os.environ.get("ORDER_PANEL_CHANNEL_ID", "0")) or None
 
@@ -42,9 +47,9 @@ PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 
 EMBED_COLOR = 0x2F3136
 
-# Produits disponibles : nom du modèle -> prix en centimes (USD)
+# Produits disponibles : nom du modèle -> {"price": centimes USD, "platform": "winsight" | "enginex"}
 DEFAULT_PRODUCTS = {
-    "XyCubValorantV2": 2000,  # $20.00
+    "XyCubValorantV2": {"price": 2000, "platform": "winsight"},
 }
 
 # ─────────────────────────────────────────────
@@ -72,7 +77,15 @@ def save_orders(data):
 
 
 def load_products():
-    return load_json(PRODUCTS_FILE, DEFAULT_PRODUCTS)
+    data = load_json(PRODUCTS_FILE, DEFAULT_PRODUCTS)
+    # Rétrocompatibilité : si un produit est juste un nombre (ancien format), on le convertit
+    normalized = {}
+    for name, value in data.items():
+        if isinstance(value, dict):
+            normalized[name] = value
+        else:
+            normalized[name] = {"price": value, "platform": "winsight"}
+    return normalized
 
 
 def create_order(order_id: str, buyer_id: int, buyer_contact: str, model: str, stripe_session_id: str):
@@ -131,16 +144,20 @@ ORDER_EMBED_DESCRIPTION = (
 )
 
 
-class ContactOnlyModal(discord.ui.Modal, title="Order Details"):
-    contact_input = discord.ui.TextInput(
-        label="Your Discord username or email",
-        max_length=200,
-        required=True,
-    )
-
+class ContactOnlyModal(discord.ui.Modal):
     def __init__(self, model_name: str):
-        super().__init__()
+        products = load_products()
+        platform = products.get(model_name, {}).get("platform", "winsight")
+
+        if platform == "enginex":
+            label = "Your email (used on EngineX)"
+        else:
+            label = "Your Discord username or ID (used on Winsight)"
+
+        super().__init__(title="Order Details")
         self.model_name = model_name
+        self.contact_input = discord.ui.TextInput(label=label, max_length=200, required=True)
+        self.add_item(self.contact_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         products = load_products()
@@ -152,7 +169,7 @@ class ContactOnlyModal(discord.ui.Modal, title="Order Details"):
             )
             return
 
-        price_cents = products[self.model_name]
+        price_cents = products[self.model_name]["price"]
         order_id = f"{interaction.user.id}_{int(time.time() * 1000)}"
 
         try:
@@ -202,8 +219,11 @@ class ModelSelect(discord.ui.Select):
     def __init__(self):
         products = load_products()
         options = [
-            discord.SelectOption(label=name, description=f"${price / 100:.2f}")
-            for name, price in products.items()
+            discord.SelectOption(
+                label=name,
+                description=f"${info['price'] / 100:.2f} • {info['platform'].capitalize()}",
+            )
+            for name, info in products.items()
         ][:25]
 
         if not options:
@@ -253,14 +273,21 @@ async def order_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("✅ Order panel posted!", ephemeral=True)
 
 
+platform_choices = [
+    app_commands.Choice(name="Winsight", value="winsight"),
+    app_commands.Choice(name="EngineX", value="enginex"),
+]
+
+
 @tree.command(name="addproduct", description="Ajouter ou mettre à jour un modèle en vente")
+@app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
-async def addproduct_cmd(interaction: discord.Interaction, model: str, price_usd: float):
+async def addproduct_cmd(interaction: discord.Interaction, model: str, price_usd: float, platform: app_commands.Choice[str]):
     products = load_products()
-    products[model] = int(price_usd * 100)
+    products[model] = {"price": int(price_usd * 100), "platform": platform.value}
     save_json(PRODUCTS_FILE, products)
     await interaction.response.send_message(
-        f"✅ Product **{model}** set to ${price_usd:.2f}.", ephemeral=True
+        f"✅ Product **{model}** set to ${price_usd:.2f} on **{platform.name}**.", ephemeral=True
     )
 
 
@@ -423,6 +450,165 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
         return False, f"Error: {str(e)}"
 
 
+async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
+    print(f"[EngineX] Starting grant for email={email}, model={model_name}")
+    try:
+        async with async_playwright() as p:
+            print("[EngineX] Launching browser...")
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+
+            print(f"[EngineX] Navigating to login page {ENGINEX_LOGIN_URL}")
+            await page.goto(ENGINEX_LOGIN_URL, timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            print("[EngineX] Filling login form...")
+            await page.locator("input[type='email'], input[name='email']").first.fill(ENGINEX_USERNAME)
+            await page.locator("input[type='password']").first.fill(ENGINEX_PASSWORD)
+
+            clicked = await page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll("button");
+                    for (const btn of buttons) {
+                        if (btn.textContent.toUpperCase().includes("SIGN IN")) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            print(f"[EngineX] Sign in button clicked via JS: {clicked}")
+            if not clicked:
+                await page.click("text=Sign in", timeout=10000)
+
+            await asyncio.sleep(3)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            print(f"[EngineX] Logged in, current URL: {page.url}")
+
+            print(f"[EngineX] Navigating to entitlements page {ENGINEX_ENTITLEMENTS_URL}")
+            await page.goto(ENGINEX_ENTITLEMENTS_URL, timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            # Cliquer sur "+ Grant Access"
+            grant_clicked = await page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll("button");
+                    for (const btn of buttons) {
+                        if (btn.textContent.toUpperCase().includes("GRANT ACCESS")) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            print(f"[EngineX] 'Grant Access' button clicked: {grant_clicked}")
+            if not grant_clicked:
+                await browser.close()
+                return False, "Could not find 'Grant Access' button on entitlements page."
+
+            await asyncio.sleep(1)
+
+            # Remplir le champ de recherche utilisateur
+            search_input = page.locator("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']").first
+            await search_input.click()
+            await search_input.fill("")
+            await search_input.type(email, delay=30)
+            print(f"[EngineX] Typed email into search field: {email}")
+
+            await asyncio.sleep(1.5)  # Laisse le temps à la recherche de remonter un résultat
+
+            # Cliquer sur le résultat de recherche qui apparaît (contient l'email tapé)
+            result_clicked = await page.evaluate(f"""
+                () => {{
+                    const emailLower = "{email}".toLowerCase();
+                    const allElements = document.querySelectorAll("*");
+                    for (const el of allElements) {{
+                        let directText = "";
+                        for (const node of el.childNodes) {{
+                            if (node.nodeType === Node.TEXT_NODE) {{
+                                directText += node.textContent;
+                            }}
+                        }}
+                        if (directText.toLowerCase().includes(emailLower)) {{
+                            // Remonte jusqu'à trouver un élément cliquable (souvent le parent direct du résultat)
+                            let clickable = el;
+                            for (let i = 0; i < 5; i++) {{
+                                if (clickable.onclick || clickable.getAttribute("role") === "button" || clickable.tagName === "BUTTON" || clickable.tagName === "LI" || clickable.tagName === "DIV") {{
+                                    clickable.click();
+                                    return true;
+                                }}
+                                clickable = clickable.parentElement;
+                                if (!clickable) break;
+                            }}
+                        }}
+                    }}
+                    return false;
+                }}
+            """)
+            print(f"[EngineX] Search result clicked: {result_clicked}")
+
+            if not result_clicked:
+                await browser.close()
+                return False, f"Could not find user matching email '{email}' in search results."
+
+            await asyncio.sleep(0.5)
+
+            # Sélectionner le bon modèle dans le dropdown
+            model_selected = await page.evaluate(f"""
+                () => {{
+                    const modelName = "{model_name}".toLowerCase();
+                    const selects = document.querySelectorAll("select");
+                    for (const select of selects) {{
+                        for (const option of select.options) {{
+                            if (option.textContent.toLowerCase().includes(modelName)) {{
+                                select.value = option.value;
+                                select.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                return true;
+                            }}
+                        }}
+                    }}
+                    return false;
+                }}
+            """)
+            print(f"[EngineX] Model '{model_name}' selected in dropdown: {model_selected}")
+
+            if not model_selected:
+                await browser.close()
+                return False, f"Could not find model '{model_name}' in the dropdown."
+
+            await asyncio.sleep(0.5)
+
+            # Cliquer sur le bouton final "Grant Access" dans le modal
+            final_clicked = await page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll("button");
+                    for (const btn of buttons) {
+                        if (btn.textContent.trim().toUpperCase() === "GRANT ACCESS") {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            print(f"[EngineX] Final 'Grant Access' click: {final_clicked}")
+
+            await asyncio.sleep(2)
+            await browser.close()
+            print("[EngineX] Browser closed.")
+
+            if final_clicked:
+                return True, f"Access granted to {email} for {model_name} on EngineX."
+            else:
+                return False, "Could not click final 'Grant Access' button."
+
+    except Exception as e:
+        print(f"[EngineX] EXCEPTION: {str(e)}")
+        return False, f"Error: {str(e)}"
+
+
 async def process_paid_order(order_id: str):
     print(f"[Order] Processing paid order: {order_id}")
     order = get_order(order_id)
@@ -433,8 +619,16 @@ async def process_paid_order(order_id: str):
     print(f"[Order] Order data: {order}")
     update_order(order_id, status="processing")
 
-    success, message = await winsight_grant(str(order["buyer_id"]), order["model"])
-    print(f"[Order] winsight_grant result: success={success}, message={message}")
+    products = load_products()
+    platform = products.get(order["model"], {}).get("platform", "winsight")
+    print(f"[Order] Routing to platform: {platform}")
+
+    if platform == "enginex":
+        success, message = await enginex_grant(order["buyer_contact"], order["model"])
+    else:
+        success, message = await winsight_grant(order["buyer_contact"], order["model"])
+
+    print(f"[Order] Grant result: success={success}, message={message}")
 
     if success:
         update_order(order_id, status="delivered")
