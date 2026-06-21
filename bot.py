@@ -989,16 +989,29 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
                 await page.wait_for_load_state("networkidle", timeout=30000)
 
             # Le chip a un attribut data-testid au format "badge-share-{index}-{discordId}"
-            # On localise d'abord la bonne carte de modèle, puis le chip précis à l'intérieur
+            # On localise d'abord le titre du modèle, puis on remonte à un conteneur assez large
+            # pour englober les chips (souvent frères, pas descendants du titre lui-même)
             try:
-                model_card = page.locator(f"*:has-text('{model_name}')").last
-                chip_locator = model_card.locator(f"[data-testid*='badge-share'][data-testid*='{discord_id}']").first
-                count = await chip_locator.count()
+                title_el = page.locator(f"*:has-text('{model_name}')").last
+                model_card = title_el
+                chip_locator = None
+
+                for _ in range(8):
+                    chip_locator = model_card.locator(
+                        f"[data-testid*='badge-share'][data-testid*='{discord_id}']"
+                    )
+                    count = await chip_locator.count()
+                    if count > 0:
+                        break
+                    model_card = model_card.locator("xpath=..")
+
                 print(f"[Winsight Revoke] Found {count} matching chip(s) for discord_id={discord_id} within model card")
 
                 if count == 0:
                     await browser.close()
                     return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}** on Winsight."
+
+                chip_locator = chip_locator.first
 
                 await chip_locator.click(timeout=5000)
                 result = "clicked"
