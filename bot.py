@@ -131,32 +131,28 @@ ORDER_EMBED_DESCRIPTION = (
 )
 
 
-class OrderDetailsModal(discord.ui.Modal, title="Order Details"):
+class ContactOnlyModal(discord.ui.Modal, title="Order Details"):
     contact_input = discord.ui.TextInput(
         label="Your Discord username or email",
         max_length=200,
         required=True,
     )
-    model_input = discord.ui.TextInput(
-        label="Which model are you looking for?",
-        max_length=200,
-        required=True,
-        placeholder="e.g. XyCubValorantV2",
-    )
+
+    def __init__(self, model_name: str):
+        super().__init__()
+        self.model_name = model_name
 
     async def on_submit(self, interaction: discord.Interaction):
-        model_name = str(self.model_input.value).strip()
         products = load_products()
 
-        if model_name not in products:
-            available = ", ".join(products.keys())
+        if self.model_name not in products:
             await interaction.response.send_message(
-                f"❌ Unknown model '{model_name}'. Available models: {available}",
+                f"❌ Model '{self.model_name}' is no longer available. Please start over.",
                 ephemeral=True,
             )
             return
 
-        price_cents = products[model_name]
+        price_cents = products[self.model_name]
         order_id = f"{interaction.user.id}_{int(time.time() * 1000)}"
 
         try:
@@ -165,7 +161,7 @@ class OrderDetailsModal(discord.ui.Modal, title="Order Details"):
                 line_items=[{
                     "price_data": {
                         "currency": "usd",
-                        "product_data": {"name": f"Weight: {model_name}"},
+                        "product_data": {"name": f"Weight: {self.model_name}"},
                         "unit_amount": price_cents,
                     },
                     "quantity": 1,
@@ -183,14 +179,14 @@ class OrderDetailsModal(discord.ui.Modal, title="Order Details"):
             order_id=order_id,
             buyer_id=interaction.user.id,
             buyer_contact=str(self.contact_input.value),
-            model=model_name,
+            model=self.model_name,
             stripe_session_id=checkout_session.id,
         )
 
         embed = discord.Embed(
             title="💳 Complete Your Payment",
             description=(
-                f"**Model:** {model_name}\n**Price:** ${price_cents / 100:.2f}\n\n"
+                f"**Model:** {self.model_name}\n**Price:** ${price_cents / 100:.2f}\n\n"
                 f"Click below to pay securely via Stripe. "
                 f"Once paid, your weight will be delivered automatically — no further action needed!"
             ),
@@ -202,13 +198,37 @@ class OrderDetailsModal(discord.ui.Modal, title="Order Details"):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+class ModelSelect(discord.ui.Select):
+    def __init__(self):
+        products = load_products()
+        options = [
+            discord.SelectOption(label=name, description=f"${price / 100:.2f}")
+            for name, price in products.items()
+        ][:25]
+
+        if not options:
+            options = [discord.SelectOption(label="No products available", value="__none__")]
+
+        super().__init__(placeholder="Choose a model...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "__none__":
+            await interaction.response.send_message("❌ No products are currently available.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ContactOnlyModal(self.values[0]))
+
+
 class OrderStartView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="🛒 Order Now", style=discord.ButtonStyle.success, custom_id="winsight_order_start")
     async def order_now(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(OrderDetailsModal())
+        select_view = discord.ui.View(timeout=120)
+        select_view.add_item(ModelSelect())
+        await interaction.response.send_message(
+            "Which model would you like to order?", view=select_view, ephemeral=True
+        )
 
 
 @bot.event
