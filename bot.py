@@ -139,6 +139,24 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ You don't have permission to use this command. Admin only.",
+            ephemeral=True,
+        )
+    else:
+        print(f"[Command Error] {error}")
+        try:
+            await interaction.response.send_message(
+                "❌ An unexpected error occurred while running this command.",
+                ephemeral=True,
+            )
+        except discord.InteractionResponded:
+            pass
+
 # Boucle asyncio principale du bot, utilisée pour planifier des coroutines
 # depuis le thread Flask (qui tourne séparément)
 main_loop = None
