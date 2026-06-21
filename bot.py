@@ -598,6 +598,21 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
 
             await asyncio.sleep(1.5)  # Laisse le temps à la recherche de remonter un résultat
 
+            # Debug : dump la structure HTML autour du champ de recherche pour identifier le vrai résultat
+            debug_dropdown_html = await page.evaluate("""
+                () => {
+                    const input = document.querySelector("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']");
+                    if (!input) return "input_not_found";
+                    let container = input.parentElement;
+                    for (let i = 0; i < 3; i++) {
+                        if (!container) break;
+                        container = container.parentElement;
+                    }
+                    return container ? container.outerHTML.substring(0, 3000) : "container_not_found";
+                }
+            """)
+            print(f"[EngineX] DEBUG dropdown area HTML:\\n{debug_dropdown_html}")
+
             # Cliquer sur le résultat de recherche via un vrai locator Playwright basé sur le texte visible
             # On exclut les <input> pour ne pas re-cliquer sur le champ de recherche lui-même
             result_clicked = False
