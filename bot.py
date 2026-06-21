@@ -47,9 +47,10 @@ PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 
 EMBED_COLOR = 0x2F3136
 
-# Produits disponibles : nom du modèle -> {"price": centimes USD, "platform": "winsight" | "enginex"}
+# Produits disponibles : nom du modèle -> {"winsight": prix_centimes, "enginex": prix_centimes}
+# Une plateforme absente du dict pour un modèle = non disponible sur cette plateforme
 DEFAULT_PRODUCTS = {
-    "XyCubValorantV2": {"price": 2000, "platform": "winsight"},
+    "XyCubValorantV2": {"winsight": 2000},
 }
 
 # ─────────────────────────────────────────────
@@ -78,22 +79,28 @@ def save_orders(data):
 
 def load_products():
     data = load_json(PRODUCTS_FILE, DEFAULT_PRODUCTS)
-    # Rétrocompatibilité : si un produit est juste un nombre (ancien format), on le convertit
+    # Rétrocompatibilité avec les anciens formats de stockage
     normalized = {}
     for name, value in data.items():
-        if isinstance(value, dict):
+        if isinstance(value, dict) and "price" in value and "platform" in value:
+            # Ancien format {"price": ..., "platform": ...} -> nouveau format
+            normalized[name] = {value["platform"]: value["price"]}
+        elif isinstance(value, dict):
+            # Déjà au nouveau format {"winsight": price, "enginex": price}
             normalized[name] = value
         else:
-            normalized[name] = {"price": value, "platform": "winsight"}
+            # Très ancien format : juste un nombre = prix sur winsight
+            normalized[name] = {"winsight": value}
     return normalized
 
 
-def create_order(order_id: str, buyer_id: int, buyer_contact: str, model: str, stripe_session_id: str):
+def create_order(order_id: str, buyer_id: int, buyer_contact: str, model: str, platform: str, stripe_session_id: str):
     data = load_orders()
     data[order_id] = {
         "buyer_id": buyer_id,
         "buyer_contact": buyer_contact,
         "model": model,
+        "platform": platform,
         "stripe_session_id": stripe_session_id,
         "status": "pending_payment",
         "staff_message_id": None,
@@ -145,10 +152,7 @@ ORDER_EMBED_DESCRIPTION = (
 
 
 class ContactOnlyModal(discord.ui.Modal):
-    def __init__(self, model_name: str):
-        products = load_products()
-        platform = products.get(model_name, {}).get("platform", "winsight")
-
+    def __init__(self, model_name: str, platform: str):
         if platform == "enginex":
             label = "Your email (used on EngineX)"
         else:
@@ -156,20 +160,21 @@ class ContactOnlyModal(discord.ui.Modal):
 
         super().__init__(title="Order Details")
         self.model_name = model_name
+        self.platform = platform
         self.contact_input = discord.ui.TextInput(label=label, max_length=200, required=True)
         self.add_item(self.contact_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         products = load_products()
 
-        if self.model_name not in products:
+        if self.model_name not in products or self.platform not in products[self.model_name]:
             await interaction.response.send_message(
-                f"❌ Model '{self.model_name}' is no longer available. Please start over.",
+                f"❌ This model/platform combination is no longer available. Please start over.",
                 ephemeral=True,
             )
             return
 
-        price_cents = products[self.model_name]["price"]
+        price_cents = products[self.model_name][self.platform]
         order_id = f"{interaction.user.id}_{int(time.time() * 1000)}"
 
         try:
@@ -178,7 +183,7 @@ class ContactOnlyModal(discord.ui.Modal):
                 line_items=[{
                     "price_data": {
                         "currency": "usd",
-                        "product_data": {"name": f"Weight: {self.model_name}"},
+                        "product_data": {"name": f"Weight: {self.model_name} ({self.platform.capitalize()})"},
                         "unit_amount": price_cents,
                     },
                     "quantity": 1,
@@ -197,13 +202,15 @@ class ContactOnlyModal(discord.ui.Modal):
             buyer_id=interaction.user.id,
             buyer_contact=str(self.contact_input.value),
             model=self.model_name,
+            platform=self.platform,
             stripe_session_id=checkout_session.id,
         )
 
         embed = discord.Embed(
             title="💳 Complete Your Payment",
             description=(
-                f"**Model:** {self.model_name}\n**Price:** ${price_cents / 100:.2f}\n\n"
+                f"**Model:** {self.model_name}\n**Platform:** {self.platform.capitalize()}\n"
+                f"**Price:** ${price_cents / 100:.2f}\n\n"
                 f"Click below to pay securely via Stripe. "
                 f"Once paid, your weight will be delivered automatically — no further action needed!"
             ),
@@ -215,16 +222,35 @@ class ContactOnlyModal(discord.ui.Modal):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+class PlatformSelect(discord.ui.Select):
+    def __init__(self, model_name: str, available_platforms: dict):
+        self.model_name = model_name
+        options = [
+            discord.SelectOption(label=platform.capitalize(), description=f"${price / 100:.2f}", value=platform)
+            for platform, price in available_platforms.items()
+        ]
+        super().__init__(placeholder="Choose a platform...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(ContactOnlyModal(self.model_name, self.values[0]))
+
+
 class ModelSelect(discord.ui.Select):
     def __init__(self):
         products = load_products()
-        options = [
-            discord.SelectOption(
-                label=name,
-                description=f"${info['price'] / 100:.2f} • {info['platform'].capitalize()}",
-            )
-            for name, info in products.items()
-        ][:25]
+        options = []
+        for name, platforms in products.items():
+            if not platforms:
+                continue
+            min_price = min(platforms.values())
+            platform_count = len(platforms)
+            if platform_count > 1:
+                desc = f"From ${min_price / 100:.2f} • {platform_count} platforms"
+            else:
+                only_platform = next(iter(platforms))
+                desc = f"${min_price / 100:.2f} • {only_platform.capitalize()}"
+            options.append(discord.SelectOption(label=name, description=desc))
+        options = options[:25]
 
         if not options:
             options = [discord.SelectOption(label="No products available", value="__none__")]
@@ -235,7 +261,28 @@ class ModelSelect(discord.ui.Select):
         if self.values[0] == "__none__":
             await interaction.response.send_message("❌ No products are currently available.", ephemeral=True)
             return
-        await interaction.response.send_modal(ContactOnlyModal(self.values[0]))
+
+        model_name = self.values[0]
+        products = load_products()
+        available_platforms = products.get(model_name, {})
+
+        if not available_platforms:
+            await interaction.response.send_message("❌ This model is no longer available.", ephemeral=True)
+            return
+
+        if len(available_platforms) == 1:
+            # Une seule plateforme dispo : on saute direct au modal de contact
+            only_platform = next(iter(available_platforms))
+            await interaction.response.send_modal(ContactOnlyModal(model_name, only_platform))
+        else:
+            # Plusieurs plateformes dispo : on demande au client de choisir
+            platform_view = discord.ui.View(timeout=120)
+            platform_view.add_item(PlatformSelect(model_name, available_platforms))
+            await interaction.response.send_message(
+                f"**{model_name}** is available on multiple platforms. Which one would you like?",
+                view=platform_view,
+                ephemeral=True,
+            )
 
 
 class OrderStartView(discord.ui.View):
@@ -279,16 +326,48 @@ platform_choices = [
 ]
 
 
-@tree.command(name="addproduct", description="Ajouter ou mettre à jour un modèle en vente")
+@tree.command(name="addproduct", description="Ajouter ou mettre à jour un modèle/plateforme en vente")
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def addproduct_cmd(interaction: discord.Interaction, model: str, price_usd: float, platform: app_commands.Choice[str]):
     products = load_products()
-    products[model] = {"price": int(price_usd * 100), "platform": platform.value}
+    if model not in products:
+        products[model] = {}
+    products[model][platform.value] = int(price_usd * 100)
     save_json(PRODUCTS_FILE, products)
     await interaction.response.send_message(
         f"✅ Product **{model}** set to ${price_usd:.2f} on **{platform.name}**.", ephemeral=True
     )
+
+
+@tree.command(name="removeproduct", description="Retirer un modèle (ou une plateforme précise) de la vente")
+@app_commands.describe(platform="Laisse vide pour retirer le modèle de TOUTES les plateformes")
+@app_commands.choices(platform=platform_choices)
+@app_commands.checks.has_permissions(administrator=True)
+async def removeproduct_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str] = None):
+    products = load_products()
+
+    if model not in products:
+        await interaction.response.send_message(f"⚠️ Model **{model}** not found.", ephemeral=True)
+        return
+
+    if platform:
+        if platform.value in products[model]:
+            del products[model][platform.value]
+            if not products[model]:
+                del products[model]
+            save_json(PRODUCTS_FILE, products)
+            await interaction.response.send_message(
+                f"🚫 Removed **{model}** from **{platform.name}**.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"⚠️ **{model}** is not available on **{platform.name}**.", ephemeral=True
+            )
+    else:
+        del products[model]
+        save_json(PRODUCTS_FILE, products)
+        await interaction.response.send_message(f"🚫 Removed **{model}** from all platforms.", ephemeral=True)
 
 
 # ─────────────────────────────────────────────
@@ -619,8 +698,7 @@ async def process_paid_order(order_id: str):
     print(f"[Order] Order data: {order}")
     update_order(order_id, status="processing")
 
-    products = load_products()
-    platform = products.get(order["model"], {}).get("platform", "winsight")
+    platform = order.get("platform", "winsight")
     print(f"[Order] Routing to platform: {platform}")
 
     if platform == "enginex":
