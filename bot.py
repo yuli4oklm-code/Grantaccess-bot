@@ -1023,10 +1023,19 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
                                     // Cherche un bouton "x" dans ce chip ou juste après
                                     let chip = inner;
                                     for (let j = 0; j < 4; j++) {{
-                                        const removeBtn = chip.querySelector("button, [role='button'], svg");
+                                        let removeBtn = chip.querySelector("button, [role='button'], svg");
                                         if (removeBtn && chip.textContent.includes(discordId) && chip.textContent.length < discordId.length + 20) {{
-                                            removeBtn.click();
-                                            return "clicked";
+                                            // Si c'est un SVG (pas de .click() natif), on clique son parent cliquable
+                                            if (removeBtn.tagName.toLowerCase() === "svg") {{
+                                                let clickTarget = removeBtn.closest("button, [role='button'], a, div[onclick]") || removeBtn.parentElement;
+                                                if (clickTarget && clickTarget.click) {{
+                                                    clickTarget.click();
+                                                    return "clicked";
+                                                }}
+                                            }} else if (removeBtn.click) {{
+                                                removeBtn.click();
+                                                return "clicked";
+                                            }}
                                         }}
                                         chip = chip.parentElement;
                                         if (!chip) break;
