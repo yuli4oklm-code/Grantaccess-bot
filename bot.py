@@ -207,7 +207,7 @@ class ContactOnlyModal(discord.ui.Modal):
                 payment_method_types=["card"],
                 line_items=[{
                     "price_data": {
-                        "currency": "usd",
+                        "currency": "eur",
                         "product_data": {"name": f"Weight: {self.model_name} ({self.platform.capitalize()})"},
                         "unit_amount": price_cents,
                     },
@@ -235,7 +235,7 @@ class ContactOnlyModal(discord.ui.Modal):
             title="💳 Complete Your Payment",
             description=(
                 f"**Model:** {self.model_name}\n**Platform:** {self.platform.capitalize()}\n"
-                f"**Price:** ${price_cents / 100:.2f}\n\n"
+                f"**Price:** €{price_cents / 100:.2f}\n\n"
                 f"Click below to pay securely via Stripe. "
                 f"Once paid, your weight will be delivered automatically — no further action needed!"
             ),
@@ -251,7 +251,7 @@ class PlatformSelect(discord.ui.Select):
     def __init__(self, model_name: str, available_platforms: dict):
         self.model_name = model_name
         options = [
-            discord.SelectOption(label=platform.capitalize(), description=f"${price / 100:.2f}", value=platform)
+            discord.SelectOption(label=platform.capitalize(), description=f"€{price / 100:.2f}", value=platform)
             for platform, price in available_platforms.items()
         ]
         super().__init__(placeholder="Choose a platform...", options=options)
@@ -277,10 +277,10 @@ class ModelSelect(discord.ui.Select):
             min_price = min(platforms.values())
             platform_count = len(platforms)
             if platform_count > 1:
-                desc = f"From ${min_price / 100:.2f} • {platform_count} platforms"
+                desc = f"From €{min_price / 100:.2f} • {platform_count} platforms"
             else:
                 only_platform = next(iter(platforms))
-                desc = f"${min_price / 100:.2f} • {only_platform.capitalize()}"
+                desc = f"€{min_price / 100:.2f} • {only_platform.capitalize()}"
             options.append(discord.SelectOption(label=name, description=desc))
         options = options[:25]
 
@@ -361,14 +361,14 @@ platform_choices = [
 @tree.command(name="addproduct", description="Ajouter ou mettre à jour un modèle/plateforme en vente")
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
-async def addproduct_cmd(interaction: discord.Interaction, model: str, price_usd: float, platform: app_commands.Choice[str]):
+async def addproduct_cmd(interaction: discord.Interaction, model: str, price_eur: float, platform: app_commands.Choice[str]):
     products = load_products()
     if model not in products:
         products[model] = {}
-    products[model][platform.value] = int(price_usd * 100)
+    products[model][platform.value] = int(price_eur * 100)
     save_json(PRODUCTS_FILE, products)
     await interaction.response.send_message(
-        f"✅ Product **{model}** set to ${price_usd:.2f} on **{platform.name}**.", ephemeral=True
+        f"✅ Product **{model}** set to €{price_eur:.2f} on **{platform.name}**.", ephemeral=True
     )
 
 
