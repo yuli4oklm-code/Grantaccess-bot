@@ -402,6 +402,38 @@ async def removeproduct_cmd(interaction: discord.Interaction, model: str, platfo
         await interaction.response.send_message(f"🚫 Removed **{model}** from all platforms.", ephemeral=True)
 
 
+def build_product_list_embed() -> discord.Embed:
+    products = load_products()
+    embed = discord.Embed(
+        title="🛒 Available Weights",
+        description="Here's everything currently available for purchase:",
+        color=EMBED_COLOR,
+    )
+
+    if not products:
+        embed.description = "No products are currently available."
+        return embed
+
+    for name, platforms in products.items():
+        if not platforms:
+            continue
+        lines = "\n".join(
+            f"● **{platform.capitalize()}** — €{price / 100:.2f}"
+            for platform, price in platforms.items()
+        )
+        embed.add_field(name=name, value=lines, inline=False)
+
+    embed.set_footer(text="Use the Order Now button to purchase!")
+    return embed
+
+
+@tree.command(name="productlist", description="Afficher la liste des modèles disponibles")
+@app_commands.describe(public="Poster publiquement dans le salon (par défaut: visible que pour toi)")
+async def productlist_cmd(interaction: discord.Interaction, public: bool = False):
+    embed = build_product_list_embed()
+    await interaction.response.send_message(embed=embed, ephemeral=not public)
+
+
 # ─────────────────────────────────────────────
 #  AUTOMATISATION WINSIGHT (Playwright)
 # ─────────────────────────────────────────────
