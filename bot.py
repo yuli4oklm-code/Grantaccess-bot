@@ -285,8 +285,17 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                     # Fallback : essaie un vrai clic Playwright sur le texte
                     await page.click("text=SIGN IN", timeout=10000)
 
+                # Attend un peu plus longtemps pour laisser la connexion s'effectuer (appel API + redirection)
+                await asyncio.sleep(3)
                 await page.wait_for_load_state("networkidle", timeout=30000)
                 print(f"[Winsight] Logged in, new title: {await page.title()}")
+
+                # Vérifie qu'on est bien sorti de l'écran de login
+                still_login = await page.query_selector("input[type='password']")
+                if still_login:
+                    print("[Winsight] WARNING: still on login screen after sign-in attempt. Credentials may be wrong, or extra wait needed.")
+                    page_text_debug = await page.evaluate("() => document.body.innerText.substring(0, 500)")
+                    print(f"[Winsight] Page text after login attempt: {page_text_debug}")
             else:
                 print("[Winsight] No login form found (already logged in?)")
 
