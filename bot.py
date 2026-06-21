@@ -1207,6 +1207,105 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run_check())
 
 
+@tree.command(name="revoke", description="Retirer l'accès d'un client à un modèle (Winsight uniquement pour l'instant)")
+@app_commands.describe(
+    model="Le modèle à retirer",
+    contact="ID Discord du client (Winsight uniquement)",
+)
+@app_commands.autocomplete(model=model_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str):
+    available = get_platforms_for_model(model)
+    if "winsight" not in available:
+        await interaction.response.send_message(
+            f"❌ **{model}** is not configured on Winsight. /revoke currently only supports Winsight.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"⏳ Revoking access to **{model}** on **Winsight** for `{contact}`...", ephemeral=True
+    )
+
+    async def run_revoke():
+        success, message = await winsight_revoke(contact, model)
+        embed = discord.Embed(
+            title="✅ Access Revoked" if success else "❌ Revoke Failed",
+            description=message,
+            color=0x57F287 if success else 0xED4245,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    asyncio.create_task(run_revoke())
+
+
+# ─────────────────────────────────────────────
+#  COMMANDE /vouch — témoignages clients
+# ─────────────────────────────────────────────
+
+class VouchModal(discord.ui.Modal, title="Leave a Vouch"):
+    text_input = discord.ui.TextInput(
+        label="Your review",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+        placeholder="Tell us about your experience...",
+    )
+
+    def __init__(self, rating: int):
+        super().__init__()
+        self.rating = rating
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not VOUCH_CHANNEL_ID:
+            await interaction.response.send_message(
+                "⚠️ Vouch channel is not configured. Please contact an admin.",
+                ephemeral=True,
+            )
+            return
+
+        channel = bot.get_channel(VOUCH_CHANNEL_ID)
+        if not channel:
+            await interaction.response.send_message(
+                "⚠️ Could not find the vouch channel. Please contact an admin.",
+                ephemeral=True,
+            )
+            return
+
+        stars = "⭐" * self.rating + "☆" * (5 - self.rating)
+
+        embed = discord.Embed(
+            title=f"{stars}",
+            description=str(self.text_input.value),
+            color=0xF1C40F,
+        )
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        embed.set_footer(text=f"Rating: {self.rating}/5")
+
+        await channel.send(embed=embed)
+        await interaction.response.send_message("✅ Thank you for your feedback!", ephemeral=True)
+
+
+class RatingSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=f"{'⭐' * i} ({i}/5)", value=str(i))
+            for i in range(5, 0, -1)
+        ]
+        super().__init__(placeholder="Choose a rating...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        rating = int(self.values[0])
+        await interaction.response.send_modal(VouchModal(rating))
+
+
+@tree.command(name="vouch", description="Laisser un témoignage sur votre expérience")
+async def vouch_cmd(interaction: discord.Interaction):
+    view = discord.ui.View(timeout=120)
+    view.add_item(RatingSelect())
+    await interaction.response.send_message("How would you rate your experience?", view=view, ephemeral=True)
+
+
 # ─────────────────────────────────────────────
 #  LANCEMENT
 # ─────────────────────────────────────────────
