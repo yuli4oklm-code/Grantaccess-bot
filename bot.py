@@ -266,7 +266,25 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                 print("[Winsight] Login form detected, logging in...")
                 await page.fill("input[type='text']", WINSIGHT_USERNAME)
                 await page.fill("input[type='password']", WINSIGHT_PASSWORD)
-                await page.click("button[type='submit']")
+
+                clicked = await page.evaluate("""
+                    () => {
+                        const buttons = document.querySelectorAll("button");
+                        for (const btn of buttons) {
+                            if (btn.textContent.toUpperCase().includes("SIGN IN")) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                print(f"[Winsight] Sign in button clicked via JS: {clicked}")
+
+                if not clicked:
+                    # Fallback : essaie un vrai clic Playwright sur le texte
+                    await page.click("text=SIGN IN", timeout=10000)
+
                 await page.wait_for_load_state("networkidle", timeout=30000)
                 print(f"[Winsight] Logged in, new title: {await page.title()}")
             else:
