@@ -632,25 +632,43 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
                 await browser.close()
                 return False, f"Could not find user matching email '{email}' in search results."
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.8)
 
-            # Sélectionner le bon modèle dans le dropdown
-            model_selected = await page.evaluate(f"""
+            # Vérification : le champ de recherche devrait maintenant être vide ou remplacé par une confirmation
+            search_field_state = await page.evaluate("""
+                () => {
+                    const input = document.querySelector("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']");
+                    return input ? input.value : "field_gone";
+                }
+            """)
+            print(f"[EngineX] Search field state after selection: '{search_field_state}'")
+
+            # Sélectionner le bon modèle dans le dropdown via Playwright (compatible React)
+            model_label = await page.evaluate(f"""
                 () => {{
                     const modelName = "{model_name}".toLowerCase();
                     const selects = document.querySelectorAll("select");
                     for (const select of selects) {{
                         for (const option of select.options) {{
                             if (option.textContent.toLowerCase().includes(modelName)) {{
-                                select.value = option.value;
-                                select.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                return true;
+                                return option.textContent;
                             }}
                         }}
                     }}
-                    return false;
+                    return null;
                 }}
             """)
+            print(f"[EngineX] Found dropdown option label: {model_label}")
+
+            model_selected = False
+            if model_label:
+                try:
+                    select_locator = page.locator("select").first
+                    await select_locator.select_option(label=model_label)
+                    model_selected = True
+                except Exception as e:
+                    print(f"[EngineX] select_option failed: {e}")
+
             print(f"[EngineX] Model '{model_name}' selected in dropdown: {model_selected}")
 
             if not model_selected:
@@ -675,11 +693,23 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
             print(f"[EngineX] Final 'Grant Access' click: {final_clicked}")
 
             await asyncio.sleep(2)
+
+            # Vérification : le modal "Grant Model Access" devrait avoir disparu si l'action a réussi
+            modal_still_open = await page.evaluate("""
+                () => {
+                    const body = document.body.innerText;
+                    return body.includes("Grant Model Access") && body.includes("Select a user and a model");
+                }
+            """)
+            print(f"[EngineX] Modal still open after final click: {modal_still_open}")
+
             await browser.close()
             print("[EngineX] Browser closed.")
 
-            if final_clicked:
+            if final_clicked and not modal_still_open:
                 return True, f"Access granted to {email} for {model_name} on EngineX."
+            elif final_clicked and modal_still_open:
+                return False, "Clicked Grant Access but modal is still open — action likely did not register (form may be incomplete or validation failed)."
             else:
                 return False, "Could not click final 'Grant Access' button."
 
