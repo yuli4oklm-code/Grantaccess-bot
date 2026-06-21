@@ -842,6 +842,242 @@ def run_flask():
 
 
 # ─────────────────────────────────────────────
+#  VÉRIFICATION D'ACCÈS (lecture seule)
+# ─────────────────────────────────────────────
+
+async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
+    print(f"[Winsight Check] Checking access for discord_id={discord_id}, model={model_name}")
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+
+            await page.goto(WINSIGHT_URL, timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            login_input = await page.query_selector("input[type='text']")
+            if login_input:
+                await page.fill("input[type='text']", WINSIGHT_USERNAME)
+                await page.fill("input[type='password']", WINSIGHT_PASSWORD)
+                await page.evaluate("""
+                    () => {
+                        const buttons = document.querySelectorAll("button");
+                        for (const btn of buttons) {
+                            if (btn.textContent.toUpperCase().includes("SIGN IN")) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                await asyncio.sleep(3)
+                await page.wait_for_load_state("networkidle", timeout=30000)
+
+            has_access = await page.evaluate(f"""
+                () => {{
+                    const modelName = "{model_name}".toLowerCase();
+                    const discordId = "{discord_id}";
+                    const allElements = document.querySelectorAll("*");
+                    let matchEl = null;
+
+                    for (const el of allElements) {{
+                        let directText = "";
+                        for (const node of el.childNodes) {{
+                            if (node.nodeType === Node.TEXT_NODE) {{
+                                directText += node.textContent;
+                            }}
+                        }}
+                        if (directText.toLowerCase().includes(modelName)) {{
+                            matchEl = el;
+                            break;
+                        }}
+                    }}
+
+                    if (!matchEl) return null;
+
+                    let parent = matchEl;
+                    for (let i = 0; i < 12; i++) {{
+                        parent = parent.parentElement;
+                        if (!parent) break;
+                        if (parent.textContent.includes(discordId)) {{
+                            return true;
+                        }}
+                        const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer']");
+                        if (input) {{
+                            // On a atteint la carte du modèle sans trouver l'ID dans son texte
+                            return false;
+                        }}
+                    }}
+                    return null;
+                }}
+            """)
+
+            await browser.close()
+
+            if has_access is True:
+                return True, f"✅ {discord_id} has access to **{model_name}** on Winsight."
+            elif has_access is False:
+                return False, f"❌ {discord_id} does NOT have access to **{model_name}** on Winsight."
+            else:
+                return False, f"⚠️ Could not determine access (model not found or page structure unclear)."
+
+    except Exception as e:
+        print(f"[Winsight Check] EXCEPTION: {str(e)}")
+        return False, f"Error checking Winsight: {str(e)}"
+
+
+async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
+    print(f"[EngineX Check] Checking access for email={email}, model={model_name}")
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+
+            await page.goto(ENGINEX_LOGIN_URL, timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            await page.locator("input[type='email'], input[name='email']").first.fill(ENGINEX_USERNAME)
+            await page.locator("input[type='password']").first.fill(ENGINEX_PASSWORD)
+            await page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll("button");
+                    for (const btn of buttons) {
+                        if (btn.textContent.toUpperCase().includes("SIGN IN")) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            await asyncio.sleep(3)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            await page.goto(ENGINEX_ENTITLEMENTS_URL, timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            has_access = await page.evaluate(f"""
+                () => {{
+                    const emailLower = "{email}".toLowerCase();
+                    const modelName = "{model_name}".toLowerCase();
+                    const rows = document.querySelectorAll("tr, [class*='row']");
+
+                    for (const row of rows) {{
+                        if (row.textContent.toLowerCase().includes(emailLower)) {{
+                            return row.textContent.toLowerCase().includes(modelName);
+                        }}
+                    }}
+                    return null;
+                }}
+            """)
+
+            await browser.close()
+
+            if has_access is True:
+                return True, f"✅ {email} has access to **{model_name}** on EngineX."
+            elif has_access is False:
+                return False, f"❌ {email} does NOT have access to **{model_name}** on EngineX."
+            else:
+                return False, f"⚠️ Could not find {email} in the entitlements list."
+
+    except Exception as e:
+        print(f"[EngineX Check] EXCEPTION: {str(e)}")
+        return False, f"Error checking EngineX: {str(e)}"
+
+
+# ─────────────────────────────────────────────
+#  COMMANDES MANUELLES (/grantaccess, /checkaccess)
+# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+#  COMMANDES MANUELLES (/grantaccess, /checkaccess) — avec autocomplete
+# ─────────────────────────────────────────────
+
+async def model_autocomplete(interaction: discord.Interaction, current: str):
+    products = load_products()
+    matches = [name for name in products.keys() if current.lower() in name.lower()]
+    return [app_commands.Choice(name=name, value=name) for name in matches[:25]]
+
+
+def get_platforms_for_model(model_name: str) -> list:
+    products = load_products()
+    return list(products.get(model_name, {}).keys())
+
+
+@tree.command(name="grantaccess", description="Donner manuellement l'accès à un modèle (paiement hors Stripe)")
+@app_commands.describe(
+    model="Le modèle à donner",
+    platform="La plateforme (Winsight ou EngineX)",
+    contact="ID Discord (Winsight) ou email (EngineX) du client",
+)
+@app_commands.autocomplete(model=model_autocomplete)
+@app_commands.choices(platform=platform_choices)
+@app_commands.checks.has_permissions(administrator=True)
+async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
+    available = get_platforms_for_model(model)
+    if platform.value not in available:
+        await interaction.response.send_message(
+            f"❌ **{model}** is not configured on **{platform.name}**. Available platforms: {', '.join(available) or 'none'}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"⏳ Granting **{model}** on **{platform.name}** to `{contact}`...", ephemeral=True
+    )
+
+    async def run_grant():
+        if platform.value == "enginex":
+            success, message = await enginex_grant(contact, model)
+        else:
+            success, message = await winsight_grant(contact, model)
+
+        embed = discord.Embed(
+            title="✅ Manual Grant Complete" if success else "❌ Manual Grant Failed",
+            description=message,
+            color=0x57F287 if success else 0xED4245,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    asyncio.create_task(run_grant())
+
+
+@tree.command(name="checkaccess", description="Vérifier si un client a déjà accès à un modèle")
+@app_commands.describe(
+    model="Le modèle à vérifier",
+    platform="La plateforme (Winsight ou EngineX)",
+    contact="ID Discord (Winsight) ou email (EngineX) du client",
+)
+@app_commands.autocomplete(model=model_autocomplete)
+@app_commands.choices(platform=platform_choices)
+@app_commands.checks.has_permissions(administrator=True)
+async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
+    available = get_platforms_for_model(model)
+    if platform.value not in available:
+        await interaction.response.send_message(
+            f"❌ **{model}** is not configured on **{platform.name}**. Available platforms: {', '.join(available) or 'none'}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"⏳ Checking **{model}** on **{platform.name}** for `{contact}`...", ephemeral=True
+    )
+
+    async def run_check():
+        if platform.value == "enginex":
+            success, message = await enginex_check(contact, model)
+        else:
+            success, message = await winsight_check(contact, model)
+
+        embed = discord.Embed(title="🔍 Access Check Result", description=message, color=0x5865F2)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    asyncio.create_task(run_check())
+
+
+# ─────────────────────────────────────────────
 #  LANCEMENT
 # ─────────────────────────────────────────────
 
