@@ -988,78 +988,31 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
                 await asyncio.sleep(3)
                 await page.wait_for_load_state("networkidle", timeout=30000)
 
-            # Cherche la carte du modèle, puis le chip contenant l'ID Discord, puis clique sur son bouton "x"
-            result = await page.evaluate(f"""
-                () => {{
-                    const modelName = "{model_name}".toLowerCase();
-                    const discordId = "{discord_id}";
-                    const allElements = document.querySelectorAll("*");
-                    let matchEl = null;
+            # Le chip a un attribut data-testid au format "badge-share-{index}-{discordId}"
+            # On localise d'abord la bonne carte de modèle, puis le chip précis à l'intérieur
+            try:
+                model_card = page.locator(f"*:has-text('{model_name}')").last
+                chip_locator = model_card.locator(f"[data-testid*='badge-share'][data-testid*='{discord_id}']").first
+                count = await chip_locator.count()
+                print(f"[Winsight Revoke] Found {count} matching chip(s) for discord_id={discord_id} within model card")
 
-                    for (const el of allElements) {{
-                        let directText = "";
-                        for (const node of el.childNodes) {{
-                            if (node.nodeType === Node.TEXT_NODE) {{
-                                directText += node.textContent;
-                            }}
-                        }}
-                        if (directText.toLowerCase().includes(modelName)) {{
-                            matchEl = el;
-                            break;
-                        }}
-                    }}
+                if count == 0:
+                    await browser.close()
+                    return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}** on Winsight."
 
-                    if (!matchEl) return "model_not_found";
-
-                    let parent = matchEl;
-                    for (let i = 0; i < 12; i++) {{
-                        parent = parent.parentElement;
-                        if (!parent) break;
-                        if (parent.textContent.includes(discordId)) {{
-                            // On a trouvé le conteneur contenant l'ID, cherche le chip précis
-                            const allInner = parent.querySelectorAll("*");
-                            for (const inner of allInner) {{
-                                if (inner.textContent.trim() === discordId || inner.textContent.includes(discordId)) {{
-                                    // Cherche un bouton "x" dans ce chip ou juste après
-                                    let chip = inner;
-                                    for (let j = 0; j < 4; j++) {{
-                                        let removeBtn = chip.querySelector("button, [role='button'], svg");
-                                        if (removeBtn && chip.textContent.includes(discordId) && chip.textContent.length < discordId.length + 20) {{
-                                            // Si c'est un SVG (pas de .click() natif), on clique son parent cliquable
-                                            if (removeBtn.tagName.toLowerCase() === "svg") {{
-                                                let clickTarget = removeBtn.closest("button, [role='button'], a, div[onclick]") || removeBtn.parentElement;
-                                                if (clickTarget && clickTarget.click) {{
-                                                    clickTarget.click();
-                                                    return "clicked";
-                                                }}
-                                            }} else if (removeBtn.click) {{
-                                                removeBtn.click();
-                                                return "clicked";
-                                            }}
-                                        }}
-                                        chip = chip.parentElement;
-                                        if (!chip) break;
-                                    }}
-                                }}
-                            }}
-                            return "chip_not_found";
-                        }}
-                    }}
-                    return "not_in_list";
-                }}
-            """)
+                await chip_locator.click(timeout=5000)
+                result = "clicked"
+            except Exception as e:
+                print(f"[Winsight Revoke] Click failed: {e}")
+                result = "click_failed"
 
             await asyncio.sleep(2)
             await browser.close()
 
             if result == "clicked":
                 return True, f"✅ Access revoked for {discord_id} on **{model_name}** (Winsight)."
-            elif result == "not_in_list":
-                return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}** on Winsight."
-            elif result == "model_not_found":
-                return False, f"❌ Could not find model '{model_name}' on Winsight."
             else:
-                return False, f"❌ Found the user but couldn't click the remove button (result: {result})."
+                return False, f"❌ Found the chip but couldn't click the remove button (result: {result})."
 
     except Exception as e:
         print(f"[Winsight Revoke] EXCEPTION: {str(e)}")
