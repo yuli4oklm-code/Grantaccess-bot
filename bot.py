@@ -320,16 +320,15 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                 print("[Winsight] No login form found (already logged in?)")
 
             print(f"[Winsight] Searching for model '{model_name}' on page...")
-            found = await page.evaluate(f"""
+
+            # Étape 1 : localiser l'élément JS contenant le nom du modèle, et obtenir un identifiant unique
+            match_info = await page.evaluate(f"""
                 () => {{
                     const modelName = "{model_name}".toLowerCase();
-
-                    // Cherche tout élément dont le texte DIRECT (pas celui des enfants) contient le nom du modèle
                     const allElements = document.querySelectorAll("*");
                     let matchEl = null;
 
                     for (const el of allElements) {{
-                        // Récupère uniquement le texte direct de cet élément (pas celui des descendants)
                         let directText = "";
                         for (const node of el.childNodes) {{
                             if (node.nodeType === Node.TEXT_NODE) {{
@@ -342,11 +341,8 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                         }}
                     }}
 
-                    if (!matchEl) {{
-                        return "not_found";
-                    }}
+                    if (!matchEl) return {{ status: "not_found" }};
 
-                    // Remonte jusqu'à 12 niveaux pour trouver le conteneur de la carte (avec input + bouton SHARE)
                     let parent = matchEl;
                     for (let i = 0; i < 12; i++) {{
                         parent = parent.parentElement;
@@ -363,17 +359,42 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                         }}
 
                         if (input && shareBtn) {{
-                            input.value = "{discord_id}";
-                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            shareBtn.click();
-                            return "clicked";
+                            // Marque l'input et le bouton avec des attributs uniques pour les retrouver via Playwright
+                            input.setAttribute("data-bot-target-input", "true");
+                            shareBtn.setAttribute("data-bot-target-button", "true");
+                            return {{
+                                status: "found",
+                                matchedText: matchEl.textContent.trim().substring(0, 100)
+                            }};
                         }}
                     }}
 
-                    return "container_not_found";
+                    return {{ status: "container_not_found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
                 }}
             """)
+            print(f"[Winsight] Match info: {match_info}")
+            if "matchedText" in match_info:
+                print(f"[Winsight] Matched element text: '{match_info['matchedText']}'")
+
+            if match_info["status"] == "found":
+                # Étape 2 : utiliser Playwright pour remplir le champ comme un vrai utilisateur (compatible React)
+                input_locator = page.locator("[data-bot-target-input='true']")
+                await input_locator.click()
+                await input_locator.fill("")
+                await input_locator.type(discord_id, delay=30)
+                await asyncio.sleep(0.5)
+
+                filled_value = await input_locator.input_value()
+                print(f"[Winsight] Input filled, current value: '{filled_value}'")
+
+                share_button = page.locator("[data-bot-target-button='true']")
+                await share_button.click()
+                print("[Winsight] Share button clicked via Playwright locator.")
+
+                found = "clicked"
+            else:
+                found = match_info["status"]
+
             print(f"[Winsight] Search result: {found}")
 
             if found == "not_found":
