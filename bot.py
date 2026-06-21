@@ -179,9 +179,9 @@ ORDER_EMBED_DESCRIPTION = (
 class ContactOnlyModal(discord.ui.Modal):
     def __init__(self, model_name: str, platform: str):
         if platform == "enginex":
-            label = "Your email (used on EngineX)"
+            label = "Your email (for EngineX)"
         else:
-            label = "Your Discord username or ID (used on Winsight)"
+            label = "Your Discord ID (for Winsight)"
 
         super().__init__(title="Order Details")
         self.model_name = model_name
