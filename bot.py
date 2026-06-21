@@ -598,34 +598,27 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
 
             await asyncio.sleep(1.5)  # Laisse le temps à la recherche de remonter un résultat
 
-            # Cliquer sur le résultat de recherche qui apparaît (contient l'email tapé)
-            result_clicked = await page.evaluate(f"""
-                () => {{
-                    const emailLower = "{email}".toLowerCase();
-                    const allElements = document.querySelectorAll("*");
-                    for (const el of allElements) {{
-                        let directText = "";
-                        for (const node of el.childNodes) {{
-                            if (node.nodeType === Node.TEXT_NODE) {{
-                                directText += node.textContent;
-                            }}
-                        }}
-                        if (directText.toLowerCase().includes(emailLower)) {{
-                            // Remonte jusqu'à trouver un élément cliquable (souvent le parent direct du résultat)
-                            let clickable = el;
-                            for (let i = 0; i < 5; i++) {{
-                                if (clickable.onclick || clickable.getAttribute("role") === "button" || clickable.tagName === "BUTTON" || clickable.tagName === "LI" || clickable.tagName === "DIV") {{
-                                    clickable.click();
-                                    return true;
-                                }}
-                                clickable = clickable.parentElement;
-                                if (!clickable) break;
-                            }}
-                        }}
-                    }}
-                    return false;
-                }}
-            """)
+            # Cliquer sur le résultat de recherche via un vrai locator Playwright basé sur le texte visible
+            # On exclut les <input> pour ne pas re-cliquer sur le champ de recherche lui-même
+            result_clicked = False
+            try:
+                result_locator = page.locator(f"*:not(input):has-text('{email}')").first
+                await result_locator.click(timeout=5000)
+                result_clicked = True
+                print("[EngineX] Search result clicked via Playwright text locator.")
+            except Exception as e:
+                print(f"[EngineX] Playwright text click failed: {e}")
+
+                # Fallback : essaie de cliquer sur le parent direct si le texte lui-même n'est pas cliquable
+                try:
+                    result_locator = page.locator(f"*:not(input):has-text('{email}')").last
+                    parent_locator = result_locator.locator("xpath=..")
+                    await parent_locator.click(timeout=5000)
+                    result_clicked = True
+                    print("[EngineX] Search result clicked via parent element fallback.")
+                except Exception as e2:
+                    print(f"[EngineX] Parent click fallback also failed: {e2}")
+
             print(f"[EngineX] Search result clicked: {result_clicked}")
 
             if not result_clicked:
