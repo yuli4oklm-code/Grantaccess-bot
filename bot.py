@@ -613,18 +613,17 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
             """)
             print(f"[EngineX] DEBUG dropdown area HTML:\\n{debug_dropdown_html}")
 
-            # Cliquer sur le résultat de recherche via un vrai locator Playwright basé sur le texte visible
-            # On exclut les <input> pour ne pas re-cliquer sur le champ de recherche lui-même
+            # Cliquer sur le résultat de recherche : on cible précisément le <div> cliquable
+            # qui a un style "cursor: pointer", comme observé dans le HTML réel du dropdown
             result_clicked = False
             try:
-                result_locator = page.locator(f"*:not(input):has-text('{email}')").first
+                result_locator = page.locator("div[style*='cursor: pointer']").first
                 await result_locator.click(timeout=5000)
                 result_clicked = True
-                print("[EngineX] Search result clicked via Playwright text locator.")
+                print("[EngineX] Search result clicked via cursor:pointer div locator.")
             except Exception as e:
-                print(f"[EngineX] Playwright text click failed: {e}")
+                print(f"[EngineX] cursor:pointer click failed: {e}")
 
-                # Fallback : essaie de cliquer sur le parent direct si le texte lui-même n'est pas cliquable
                 try:
                     result_locator = page.locator(f"*:not(input):has-text('{email}')").last
                     parent_locator = result_locator.locator("xpath=..")
@@ -684,6 +683,20 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
                 return False, f"Could not find model '{model_name}' in the dropdown."
 
             await asyncio.sleep(0.5)
+
+            # Vérifie d'abord si le bouton final est désactivé (signe que le user n'a pas été sélectionné)
+            button_disabled = await page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll("button[type='submit']");
+                    for (const btn of buttons) {
+                        if (btn.textContent.trim().toUpperCase() === "GRANT ACCESS") {
+                            return btn.disabled;
+                        }
+                    }
+                    return null;
+                }
+            """)
+            print(f"[EngineX] Grant Access button disabled state before click: {button_disabled}")
 
             # Cliquer sur le bouton final "Grant Access" dans le modal
             final_clicked = await page.evaluate("""
