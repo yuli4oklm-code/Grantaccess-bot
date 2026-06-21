@@ -294,33 +294,55 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
             found = await page.evaluate(f"""
                 () => {{
                     const modelName = "{model_name}".toLowerCase();
+
+                    // Cherche tout élément dont le texte DIRECT (pas celui des enfants) contient le nom du modèle
                     const allElements = document.querySelectorAll("*");
+                    let matchEl = null;
 
                     for (const el of allElements) {{
-                        if (el.children.length === 0 && el.textContent.toLowerCase().includes(modelName)) {{
-                            let parent = el;
-                            for (let i = 0; i < 10; i++) {{
-                                parent = parent.parentElement;
-                                if (!parent) break;
-                                const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']");
-                                if (input) {{
-                                    input.value = "{discord_id}";
-                                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-
-                                    const buttons = parent.querySelectorAll("button");
-                                    for (const btn of buttons) {{
-                                        if (btn.textContent.toUpperCase().includes("SHARE")) {{
-                                            btn.click();
-                                            return "clicked";
-                                        }}
-                                    }}
-                                    return "input_filled_no_button";
-                                }}
+                        // Récupère uniquement le texte direct de cet élément (pas celui des descendants)
+                        let directText = "";
+                        for (const node of el.childNodes) {{
+                            if (node.nodeType === Node.TEXT_NODE) {{
+                                directText += node.textContent;
                             }}
                         }}
+                        if (directText.toLowerCase().includes(modelName)) {{
+                            matchEl = el;
+                            break;
+                        }}
                     }}
-                    return "not_found";
+
+                    if (!matchEl) {{
+                        return "not_found";
+                    }}
+
+                    // Remonte jusqu'à 12 niveaux pour trouver le conteneur de la carte (avec input + bouton SHARE)
+                    let parent = matchEl;
+                    for (let i = 0; i < 12; i++) {{
+                        parent = parent.parentElement;
+                        if (!parent) break;
+
+                        const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']");
+                        const buttons = parent.querySelectorAll("button");
+                        let shareBtn = null;
+                        for (const btn of buttons) {{
+                            if (btn.textContent.toUpperCase().includes("SHARE")) {{
+                                shareBtn = btn;
+                                break;
+                            }}
+                        }}
+
+                        if (input && shareBtn) {{
+                            input.value = "{discord_id}";
+                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            shareBtn.click();
+                            return "clicked";
+                        }}
+                    }}
+
+                    return "container_not_found";
                 }}
             """)
             print(f"[Winsight] Search result: {found}")
@@ -331,8 +353,8 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
 
             if found == "clicked":
                 return True, f"Access granted to {discord_id} for {model_name} on Winsight."
-            elif found == "input_filled_no_button":
-                return False, "Input filled but Share button not found."
+            elif found == "container_not_found":
+                return False, f"Found model name '{model_name}' but couldn't locate its input/share button container."
             else:
                 return False, f"Could not find model '{model_name}' on Winsight."
 
