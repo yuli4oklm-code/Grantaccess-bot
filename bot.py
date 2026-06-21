@@ -347,6 +347,16 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
             """)
             print(f"[Winsight] Search result: {found}")
 
+            if found == "not_found":
+                # Dump le HTML pour debug : on cherche manuellement la zone qui contient "XyCub" ou "Weights"
+                debug_html = await page.evaluate("""
+                    () => {
+                        const body = document.body.innerText;
+                        return body.substring(0, 2000);
+                    }
+                """)
+                print(f"[Winsight] DEBUG page text content:\\n{debug_html}")
+
             await asyncio.sleep(2)
             await browser.close()
             print("[Winsight] Browser closed.")
