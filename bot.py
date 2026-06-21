@@ -39,6 +39,7 @@ ENGINEX_ENTITLEMENTS_URL = os.environ.get("ENGINEX_ENTITLEMENTS_URL", "https://e
 
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
 ORDER_PANEL_CHANNEL_ID = int(os.environ.get("ORDER_PANEL_CHANNEL_ID", "0")) or None
+VOUCH_CHANNEL_ID = int(os.environ.get("VOUCH_CHANNEL_ID", "0")) or None
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -157,6 +158,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         except discord.InteractionResponded:
             pass
 
+
+@bot.event
+async def on_error(event_method, *args, **kwargs):
+    import traceback
+    print(f"[Bot Error] in {event_method}: {traceback.format_exc()}")
+
 # Boucle asyncio principale du bot, utilisée pour planifier des coroutines
 # depuis le thread Flask (qui tourne séparément)
 main_loop = None
@@ -250,7 +257,14 @@ class PlatformSelect(discord.ui.Select):
         super().__init__(placeholder="Choose a platform...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(ContactOnlyModal(self.model_name, self.values[0]))
+        try:
+            await interaction.response.send_modal(ContactOnlyModal(self.model_name, self.values[0]))
+        except Exception as e:
+            print(f"[PlatformSelect Error] {type(e).__name__}: {e}")
+            try:
+                await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+            except Exception:
+                pass
 
 
 class ModelSelect(discord.ui.Select):
@@ -943,6 +957,104 @@ async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
     except Exception as e:
         print(f"[Winsight Check] EXCEPTION: {str(e)}")
         return False, f"Error checking Winsight: {str(e)}"
+
+
+async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
+    print(f"[Winsight Revoke] Starting revoke for discord_id={discord_id}, model={model_name}")
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+
+            await page.goto(WINSIGHT_URL, timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+
+            login_input = await page.query_selector("input[type='text']")
+            if login_input:
+                await page.fill("input[type='text']", WINSIGHT_USERNAME)
+                await page.fill("input[type='password']", WINSIGHT_PASSWORD)
+                await page.evaluate("""
+                    () => {
+                        const buttons = document.querySelectorAll("button");
+                        for (const btn of buttons) {
+                            if (btn.textContent.toUpperCase().includes("SIGN IN")) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                await asyncio.sleep(3)
+                await page.wait_for_load_state("networkidle", timeout=30000)
+
+            # Cherche la carte du modèle, puis le chip contenant l'ID Discord, puis clique sur son bouton "x"
+            result = await page.evaluate(f"""
+                () => {{
+                    const modelName = "{model_name}".toLowerCase();
+                    const discordId = "{discord_id}";
+                    const allElements = document.querySelectorAll("*");
+                    let matchEl = null;
+
+                    for (const el of allElements) {{
+                        let directText = "";
+                        for (const node of el.childNodes) {{
+                            if (node.nodeType === Node.TEXT_NODE) {{
+                                directText += node.textContent;
+                            }}
+                        }}
+                        if (directText.toLowerCase().includes(modelName)) {{
+                            matchEl = el;
+                            break;
+                        }}
+                    }}
+
+                    if (!matchEl) return "model_not_found";
+
+                    let parent = matchEl;
+                    for (let i = 0; i < 12; i++) {{
+                        parent = parent.parentElement;
+                        if (!parent) break;
+                        if (parent.textContent.includes(discordId)) {{
+                            // On a trouvé le conteneur contenant l'ID, cherche le chip précis
+                            const allInner = parent.querySelectorAll("*");
+                            for (const inner of allInner) {{
+                                if (inner.textContent.trim() === discordId || inner.textContent.includes(discordId)) {{
+                                    // Cherche un bouton "x" dans ce chip ou juste après
+                                    let chip = inner;
+                                    for (let j = 0; j < 4; j++) {{
+                                        const removeBtn = chip.querySelector("button, [role='button'], svg");
+                                        if (removeBtn && chip.textContent.includes(discordId) && chip.textContent.length < discordId.length + 20) {{
+                                            removeBtn.click();
+                                            return "clicked";
+                                        }}
+                                        chip = chip.parentElement;
+                                        if (!chip) break;
+                                    }}
+                                }}
+                            }}
+                            return "chip_not_found";
+                        }}
+                    }}
+                    return "not_in_list";
+                }}
+            """)
+
+            await asyncio.sleep(2)
+            await browser.close()
+
+            if result == "clicked":
+                return True, f"✅ Access revoked for {discord_id} on **{model_name}** (Winsight)."
+            elif result == "not_in_list":
+                return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}** on Winsight."
+            elif result == "model_not_found":
+                return False, f"❌ Could not find model '{model_name}' on Winsight."
+            else:
+                return False, f"❌ Found the user but couldn't click the remove button (result: {result})."
+
+    except Exception as e:
+        print(f"[Winsight Revoke] EXCEPTION: {str(e)}")
+        return False, f"Error revoking on Winsight: {str(e)}"
 
 
 async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
