@@ -48,6 +48,7 @@ PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
 
 EMBED_COLOR = 0x2F3136
+CONFIG_BACKUP_MARKER = "WINSIGHT_BOT_CONFIG_BACKUP_V1"
 
 # Produits disponibles : nom du modèle -> {"winsight": prix_centimes, "enginex": prix_centimes}
 DEFAULT_PRODUCTS = {
@@ -170,6 +171,99 @@ async def on_error(event_method, *args, **kwargs):
     print(f"[Bot Error] in {event_method}: {traceback.format_exc()}")
 
 main_loop = None
+
+
+async def get_config_backup_channel():
+    if not STAFF_CHANNEL_ID:
+        return None
+
+    channel = bot.get_channel(STAFF_CHANNEL_ID)
+    if channel:
+        return channel
+
+    try:
+        return await bot.fetch_channel(STAFF_CHANNEL_ID)
+    except Exception as e:
+        print(f"[Config Backup] Could not fetch staff channel: {e}")
+        return None
+
+
+async def find_config_backup_message():
+    channel = await get_config_backup_channel()
+    if not channel:
+        return None
+
+    try:
+        async for message in channel.history(limit=100):
+            if message.author == bot.user and CONFIG_BACKUP_MARKER in message.content:
+                return message
+    except Exception as e:
+        print(f"[Config Backup] Could not read channel history: {e}")
+
+    return None
+
+
+def parse_config_backup(content: str):
+    start = content.find("{")
+    end = content.rfind("}") + 1
+    if start < 0 or end <= start:
+        return None
+
+    try:
+        return json.loads(content[start:end])
+    except json.JSONDecodeError as e:
+        print(f"[Config Backup] Invalid backup JSON: {e}")
+        return None
+
+
+async def restore_config_from_discord():
+    message = await find_config_backup_message()
+    if not message:
+        print("[Config Backup] No Discord backup found.")
+        return False
+
+    payload = parse_config_backup(message.content)
+    if not payload:
+        return False
+
+    if "products" in payload:
+        save_json(PRODUCTS_FILE, payload["products"])
+    if "pipelines" in payload:
+        save_pipelines(payload["pipelines"])
+
+    print("[Config Backup] Restored products/pipelines from Discord backup.")
+    return True
+
+
+async def backup_config_to_discord(reason: str = "manual update"):
+    channel = await get_config_backup_channel()
+    if not channel:
+        print("[Config Backup] STAFF_CHANNEL_ID is not configured; backup skipped.")
+        return
+
+    payload = {
+        "version": 1,
+        "updated_at": int(time.time()),
+        "reason": reason,
+        "products": load_products(),
+        "pipelines": load_pipelines(),
+    }
+    content = f"{CONFIG_BACKUP_MARKER}\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
+
+    if len(content) > 2000:
+        print("[Config Backup] Backup is too large for one Discord message; backup skipped.")
+        return
+
+    try:
+        message = await find_config_backup_message()
+        if message:
+            await message.edit(content=content)
+            print(f"[Config Backup] Updated Discord backup ({reason}).")
+        else:
+            await channel.send(content)
+            print(f"[Config Backup] Created Discord backup ({reason}).")
+    except Exception as e:
+        print(f"[Config Backup] Could not write Discord backup: {e}")
 
 
 ORDER_EMBED_TITLE = "🛒 Order a Weight"
@@ -333,6 +427,10 @@ class OrderStartView(discord.ui.View):
 
 @bot.event
 async def on_ready():
+    restored = await restore_config_from_discord()
+    if not restored:
+        await backup_config_to_discord("initial startup backup")
+
     await tree.sync()
     bot.add_view(OrderStartView())
     print(f"✅ Bot connecté en tant que {bot.user} (ID: {bot.user.id})")
@@ -371,6 +469,7 @@ async def addproduct_cmd(interaction: discord.Interaction, model: str, price_eur
     await interaction.response.send_message(
         f"✅ Product **{model}** set to €{price_eur:.2f} on **{platform.name}**.", ephemeral=True
     )
+    await backup_config_to_discord("addproduct")
 
 
 @tree.command(name="removeproduct", description="Retirer un modèle (ou une plateforme précise) de la vente")
@@ -393,6 +492,7 @@ async def removeproduct_cmd(interaction: discord.Interaction, model: str, platfo
             await interaction.response.send_message(
                 f"🚫 Removed **{model}** from **{platform.name}**.", ephemeral=True
             )
+            await backup_config_to_discord("removeproduct")
         else:
             await interaction.response.send_message(
                 f"⚠️ **{model}** is not available on **{platform.name}**.", ephemeral=True
@@ -401,6 +501,7 @@ async def removeproduct_cmd(interaction: discord.Interaction, model: str, platfo
         del products[model]
         save_json(PRODUCTS_FILE, products)
         await interaction.response.send_message(f"🚫 Removed **{model}** from all platforms.", ephemeral=True)
+        await backup_config_to_discord("removeproduct")
 
 
 def build_product_list_embed() -> discord.Embed:
@@ -1138,6 +1239,7 @@ async def setpipeline_cmd(interaction: discord.Interaction, pipeline: str, site_
         f"✅ Pipeline **{pipeline}** enregistrée avec le nom Winsight exact: `{site_name}`.",
         ephemeral=False,
     )
+    await backup_config_to_discord("setpipeline")
 
 
 @tree.command(name="removepipeline", description="Supprimer une pipeline enregistrée")
@@ -1153,6 +1255,7 @@ async def removepipeline_cmd(interaction: discord.Interaction, pipeline: str):
     del pipelines[pipeline]
     save_pipelines(pipelines)
     await interaction.response.send_message(f"🚫 Pipeline **{pipeline}** supprimée.", ephemeral=False)
+    await backup_config_to_discord("removepipeline")
 
 
 @tree.command(name="pipelinelist", description="Afficher les pipelines enregistrées")
