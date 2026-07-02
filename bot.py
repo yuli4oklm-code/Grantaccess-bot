@@ -45,6 +45,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 ORDERS_FILE = os.path.join(DATA_DIR, "winsight_orders.json")
 PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
+PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
 
 EMBED_COLOR = 0x2F3136
 
@@ -52,6 +53,7 @@ EMBED_COLOR = 0x2F3136
 DEFAULT_PRODUCTS = {
     "XyCubValorantV2": {"winsight": 2000},
 }
+DEFAULT_PIPELINES = {}
 
 # ─────────────────────────────────────────────
 #  STOCKAGE
@@ -88,6 +90,14 @@ def load_products():
         else:
             normalized[name] = {"winsight": value}
     return normalized
+
+
+def load_pipelines():
+    return load_json(PIPELINES_FILE, DEFAULT_PIPELINES)
+
+
+def save_pipelines(data):
+    save_json(PIPELINES_FILE, data)
 
 
 def create_order(order_id: str, buyer_id: int, buyer_contact: str, model: str, platform: str, stripe_session_id: str):
@@ -573,6 +583,13 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
     except Exception as e:
         print(f"[Winsight] EXCEPTION: {str(e)}")
         return False, f"Error: {str(e)}"
+
+
+async def winsight_grant_pipeline(discord_id: str, pipeline_site_name: str) -> tuple[bool, str]:
+    success, message = await winsight_grant(discord_id, pipeline_site_name)
+    if success:
+        return True, f"Pipeline access granted to {discord_id} for {pipeline_site_name} on Winsight."
+    return False, message
 
 
 async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
@@ -1096,9 +1113,113 @@ async def model_autocomplete(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=name, value=name) for name in matches[:25]]
 
 
+async def pipeline_autocomplete(interaction: discord.Interaction, current: str):
+    pipelines = load_pipelines()
+    matches = [name for name in pipelines.keys() if current.lower() in name.lower()]
+    return [app_commands.Choice(name=name, value=name) for name in matches[:25]]
+
+
 def get_platforms_for_model(model_name: str) -> list:
     products = load_products()
     return list(products.get(model_name, {}).keys())
+
+
+@tree.command(name="setpipeline", description="Enregistrer le nom exact d'une pipeline sur Winsight")
+@app_commands.describe(
+    pipeline="Nom court à utiliser dans Discord",
+    site_name="Nom exact de la pipeline tel qu'il apparaît sur Winsight",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setpipeline_cmd(interaction: discord.Interaction, pipeline: str, site_name: str):
+    pipelines = load_pipelines()
+    pipelines[pipeline] = site_name
+    save_pipelines(pipelines)
+    await interaction.response.send_message(
+        f"✅ Pipeline **{pipeline}** enregistrée avec le nom Winsight exact: `{site_name}`.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="removepipeline", description="Supprimer une pipeline enregistrée")
+@app_commands.describe(pipeline="Pipeline à supprimer")
+@app_commands.autocomplete(pipeline=pipeline_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def removepipeline_cmd(interaction: discord.Interaction, pipeline: str):
+    pipelines = load_pipelines()
+    if pipeline not in pipelines:
+        await interaction.response.send_message(f"⚠️ Pipeline **{pipeline}** introuvable.", ephemeral=True)
+        return
+
+    del pipelines[pipeline]
+    save_pipelines(pipelines)
+    await interaction.response.send_message(f"🚫 Pipeline **{pipeline}** supprimée.", ephemeral=True)
+
+
+@tree.command(name="pipelinelist", description="Afficher les pipelines enregistrées")
+@app_commands.checks.has_permissions(administrator=True)
+async def pipelinelist_cmd(interaction: discord.Interaction):
+    pipelines = load_pipelines()
+    if not pipelines:
+        await interaction.response.send_message("Aucune pipeline enregistrée.", ephemeral=True)
+        return
+
+    lines = [f"● **{name}** → `{site_name}`" for name, site_name in pipelines.items()]
+    embed = discord.Embed(
+        title="Pipelines Winsight enregistrées",
+        description="\n".join(lines),
+        color=EMBED_COLOR,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="pipelineadd", description="Ajouter une pipeline Winsight à un utilisateur")
+@app_commands.describe(
+    pipeline="Pipeline enregistrée à ajouter",
+    discord_id="ID Discord du client sur Winsight",
+)
+@app_commands.autocomplete(pipeline=pipeline_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, discord_id: str):
+    pipelines = load_pipelines()
+    if pipeline not in pipelines:
+        await interaction.response.send_message(
+            f"❌ Pipeline **{pipeline}** introuvable. Utilise d'abord `/setpipeline` avec le nom exact Winsight.",
+            ephemeral=True,
+        )
+        return
+
+    site_name = pipelines[pipeline]
+    await interaction.response.send_message(
+        f"⏳ Adding pipeline **{pipeline}** (`{site_name}` on Winsight) to `{discord_id}`...",
+        ephemeral=True,
+    )
+
+    async def run_pipeline_add():
+        success, message = await winsight_grant_pipeline(discord_id, site_name)
+        embed = discord.Embed(
+            title=f"✅ Pipeline Added — {pipeline}" if success else "❌ Pipeline Add Failed",
+            description=message,
+            color=0x57F287 if success else 0xED4245,
+        )
+        embed.add_field(name="User", value=f"<@{discord_id}> ({discord_id})", inline=False)
+        embed.add_field(name="Winsight Name", value=site_name, inline=False)
+        embed.set_footer(text=f"Pipeline Add • by {interaction.user}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        if STAFF_CHANNEL_ID:
+            channel = bot.get_channel(STAFF_CHANNEL_ID)
+            if channel:
+                staff_embed = discord.Embed(
+                    title=f"✅ Pipeline Added — {pipeline}" if success else "❌ Pipeline Add Failed",
+                    description=message,
+                    color=0x57F287 if success else 0xED4245,
+                )
+                staff_embed.add_field(name="User", value=f"<@{discord_id}> ({discord_id})", inline=False)
+                staff_embed.add_field(name="Winsight Name", value=site_name, inline=False)
+                staff_embed.set_footer(text=f"Pipeline Add by {interaction.user}")
+                await channel.send(embed=staff_embed)
+
+    asyncio.create_task(run_pipeline_add())
 
 
 @tree.command(name="grantaccess", description="Donner manuellement l'accès à un modèle (paiement hors Stripe)")
