@@ -1136,7 +1136,7 @@ async def setpipeline_cmd(interaction: discord.Interaction, pipeline: str, site_
     save_pipelines(pipelines)
     await interaction.response.send_message(
         f"✅ Pipeline **{pipeline}** enregistrée avec le nom Winsight exact: `{site_name}`.",
-        ephemeral=True,
+        ephemeral=False,
     )
 
 
@@ -1147,12 +1147,12 @@ async def setpipeline_cmd(interaction: discord.Interaction, pipeline: str, site_
 async def removepipeline_cmd(interaction: discord.Interaction, pipeline: str):
     pipelines = load_pipelines()
     if pipeline not in pipelines:
-        await interaction.response.send_message(f"⚠️ Pipeline **{pipeline}** introuvable.", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ Pipeline **{pipeline}** introuvable.", ephemeral=False)
         return
 
     del pipelines[pipeline]
     save_pipelines(pipelines)
-    await interaction.response.send_message(f"🚫 Pipeline **{pipeline}** supprimée.", ephemeral=True)
+    await interaction.response.send_message(f"🚫 Pipeline **{pipeline}** supprimée.", ephemeral=False)
 
 
 @tree.command(name="pipelinelist", description="Afficher les pipelines enregistrées")
@@ -1160,7 +1160,7 @@ async def removepipeline_cmd(interaction: discord.Interaction, pipeline: str):
 async def pipelinelist_cmd(interaction: discord.Interaction):
     pipelines = load_pipelines()
     if not pipelines:
-        await interaction.response.send_message("Aucune pipeline enregistrée.", ephemeral=True)
+        await interaction.response.send_message("Aucune pipeline enregistrée.", ephemeral=False)
         return
 
     lines = [f"● **{name}** → `{site_name}`" for name, site_name in pipelines.items()]
@@ -1169,7 +1169,7 @@ async def pipelinelist_cmd(interaction: discord.Interaction):
         description="\n".join(lines),
         color=EMBED_COLOR,
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 @tree.command(name="pipelineadd", description="Ajouter une pipeline Winsight à un utilisateur")
@@ -1184,14 +1184,14 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
     if pipeline not in pipelines:
         await interaction.response.send_message(
             f"❌ Pipeline **{pipeline}** introuvable. Utilise d'abord `/setpipeline` avec le nom exact Winsight.",
-            ephemeral=True,
+            ephemeral=False,
         )
         return
 
     site_name = pipelines[pipeline]
     await interaction.response.send_message(
         f"⏳ Adding pipeline **{pipeline}** (`{site_name}` on Winsight) to `{discord_id}`...",
-        ephemeral=True,
+        ephemeral=False,
     )
 
     async def run_pipeline_add():
@@ -1204,20 +1204,7 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
         embed.add_field(name="User", value=f"<@{discord_id}> ({discord_id})", inline=False)
         embed.add_field(name="Winsight Name", value=site_name, inline=False)
         embed.set_footer(text=f"Pipeline Add • by {interaction.user}")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-        if STAFF_CHANNEL_ID:
-            channel = bot.get_channel(STAFF_CHANNEL_ID)
-            if channel:
-                staff_embed = discord.Embed(
-                    title=f"✅ Pipeline Added — {pipeline}" if success else "❌ Pipeline Add Failed",
-                    description=message,
-                    color=0x57F287 if success else 0xED4245,
-                )
-                staff_embed.add_field(name="User", value=f"<@{discord_id}> ({discord_id})", inline=False)
-                staff_embed.add_field(name="Winsight Name", value=site_name, inline=False)
-                staff_embed.set_footer(text=f"Pipeline Add by {interaction.user}")
-                await channel.send(embed=staff_embed)
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
     asyncio.create_task(run_pipeline_add())
 
