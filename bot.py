@@ -49,7 +49,6 @@ PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 EMBED_COLOR = 0x2F3136
 
 # Produits disponibles : nom du modèle -> {"winsight": prix_centimes, "enginex": prix_centimes}
-# Une plateforme absente du dict pour un modèle = non disponible sur cette plateforme
 DEFAULT_PRODUCTS = {
     "XyCubValorantV2": {"winsight": 2000},
 }
@@ -80,17 +79,13 @@ def save_orders(data):
 
 def load_products():
     data = load_json(PRODUCTS_FILE, DEFAULT_PRODUCTS)
-    # Rétrocompatibilité avec les anciens formats de stockage
     normalized = {}
     for name, value in data.items():
         if isinstance(value, dict) and "price" in value and "platform" in value:
-            # Ancien format {"price": ..., "platform": ...} -> nouveau format
             normalized[name] = {value["platform"]: value["price"]}
         elif isinstance(value, dict):
-            # Déjà au nouveau format {"winsight": price, "enginex": price}
             normalized[name] = value
         else:
-            # Très ancien format : juste un nombre = prix sur winsight
             normalized[name] = {"winsight": value}
     return normalized
 
@@ -164,8 +159,6 @@ async def on_error(event_method, *args, **kwargs):
     import traceback
     print(f"[Bot Error] in {event_method}: {traceback.format_exc()}")
 
-# Boucle asyncio principale du bot, utilisée pour planifier des coroutines
-# depuis le thread Flask (qui tourne séparément)
 main_loop = None
 
 
@@ -303,11 +296,9 @@ class ModelSelect(discord.ui.Select):
             return
 
         if len(available_platforms) == 1:
-            # Une seule plateforme dispo : on saute direct au modal de contact
             only_platform = next(iter(available_platforms))
             await interaction.response.send_modal(ContactOnlyModal(model_name, only_platform))
         else:
-            # Plusieurs plateformes dispo : on demande au client de choisir
             platform_view = discord.ui.View(timeout=120)
             platform_view.add_item(PlatformSelect(model_name, available_platforms))
             await interaction.response.send_message(
@@ -472,18 +463,15 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                 print(f"[Winsight] Sign in button clicked via JS: {clicked}")
 
                 if not clicked:
-                    # Fallback : essaie un vrai clic Playwright sur le texte
                     await page.click("text=SIGN IN", timeout=10000)
 
-                # Attend un peu plus longtemps pour laisser la connexion s'effectuer (appel API + redirection)
                 await asyncio.sleep(3)
                 await page.wait_for_load_state("networkidle", timeout=30000)
                 print(f"[Winsight] Logged in, new title: {await page.title()}")
 
-                # Vérifie qu'on est bien sorti de l'écran de login
                 still_login = await page.query_selector("input[type='password']")
                 if still_login:
-                    print("[Winsight] WARNING: still on login screen after sign-in attempt. Credentials may be wrong, or extra wait needed.")
+                    print("[Winsight] WARNING: still on login screen after sign-in attempt.")
                     page_text_debug = await page.evaluate("() => document.body.innerText.substring(0, 500)")
                     print(f"[Winsight] Page text after login attempt: {page_text_debug}")
             else:
@@ -491,7 +479,6 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
 
             print(f"[Winsight] Searching for model '{model_name}' on page...")
 
-            # Étape 1 : localiser l'élément JS contenant le nom du modèle, et obtenir un identifiant unique
             match_info = await page.evaluate(f"""
                 () => {{
                     const modelName = "{model_name}".toLowerCase();
@@ -529,7 +516,6 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                         }}
 
                         if (input && shareBtn) {{
-                            // Marque l'input et le bouton avec des attributs uniques pour les retrouver via Playwright
                             input.setAttribute("data-bot-target-input", "true");
                             shareBtn.setAttribute("data-bot-target-button", "true");
                             return {{
@@ -543,11 +529,8 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                 }}
             """)
             print(f"[Winsight] Match info: {match_info}")
-            if "matchedText" in match_info:
-                print(f"[Winsight] Matched element text: '{match_info['matchedText']}'")
 
             if match_info["status"] == "found":
-                # Étape 2 : utiliser Playwright pour remplir le champ comme un vrai utilisateur (compatible React)
                 input_locator = page.locator("[data-bot-target-input='true']")
                 await input_locator.click()
                 await input_locator.fill("")
@@ -568,14 +551,13 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
             print(f"[Winsight] Search result: {found}")
 
             if found == "not_found":
-                # Dump le HTML pour debug : on cherche manuellement la zone qui contient "XyCub" ou "Weights"
                 debug_html = await page.evaluate("""
                     () => {
                         const body = document.body.innerText;
                         return body.substring(0, 2000);
                     }
                 """)
-                print(f"[Winsight] DEBUG page text content:\\n{debug_html}")
+                print(f"[Winsight] DEBUG page text content:\n{debug_html}")
 
             await asyncio.sleep(2)
             await browser.close()
@@ -633,7 +615,6 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
             await page.goto(ENGINEX_ENTITLEMENTS_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
 
-            # Cliquer sur "+ Grant Access"
             grant_clicked = await page.evaluate("""
                 () => {
                     const buttons = document.querySelectorAll("button");
@@ -653,16 +634,14 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
 
             await asyncio.sleep(1)
 
-            # Remplir le champ de recherche utilisateur
             search_input = page.locator("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']").first
             await search_input.click()
             await search_input.fill("")
             await search_input.type(email, delay=30)
             print(f"[EngineX] Typed email into search field: {email}")
 
-            await asyncio.sleep(1.5)  # Laisse le temps à la recherche de remonter un résultat
+            await asyncio.sleep(1.5)
 
-            # Debug : dump la structure HTML autour du champ de recherche pour identifier le vrai résultat
             debug_dropdown_html = await page.evaluate("""
                 () => {
                     const input = document.querySelector("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']");
@@ -675,10 +654,8 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
                     return container ? container.outerHTML.substring(0, 3000) : "container_not_found";
                 }
             """)
-            print(f"[EngineX] DEBUG dropdown area HTML:\\n{debug_dropdown_html}")
+            print(f"[EngineX] DEBUG dropdown area HTML:\n{debug_dropdown_html}")
 
-            # Cliquer sur le résultat de recherche : on cible précisément le <div> cliquable
-            # qui a un style "cursor: pointer", comme observé dans le HTML réel du dropdown
             result_clicked = False
             try:
                 result_locator = page.locator("div[style*='cursor: pointer']").first
@@ -705,7 +682,6 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
 
             await asyncio.sleep(0.8)
 
-            # Vérification : le champ de recherche devrait maintenant être vide ou remplacé par une confirmation
             search_field_state = await page.evaluate("""
                 () => {
                     const input = document.querySelector("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']");
@@ -714,7 +690,6 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
             """)
             print(f"[EngineX] Search field state after selection: '{search_field_state}'")
 
-            # Sélectionner le bon modèle dans le dropdown via Playwright (compatible React)
             model_label = await page.evaluate(f"""
                 () => {{
                     const modelName = "{model_name}".toLowerCase();
@@ -748,7 +723,6 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
 
             await asyncio.sleep(0.5)
 
-            # Vérifie d'abord si le bouton final est désactivé (signe que le user n'a pas été sélectionné)
             button_disabled = await page.evaluate("""
                 () => {
                     const buttons = document.querySelectorAll("button[type='submit']");
@@ -762,7 +736,6 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
             """)
             print(f"[EngineX] Grant Access button disabled state before click: {button_disabled}")
 
-            # Cliquer sur le bouton final "Grant Access" dans le modal
             final_clicked = await page.evaluate("""
                 () => {
                     const buttons = document.querySelectorAll("button");
@@ -779,7 +752,6 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
 
             await asyncio.sleep(2)
 
-            # Vérification : le modal "Grant Model Access" devrait avoir disparu si l'action a réussi
             modal_still_open = await page.evaluate("""
                 () => {
                     const body = document.body.innerText;
@@ -794,7 +766,7 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
             if final_clicked and not modal_still_open:
                 return True, f"Access granted to {email} for {model_name} on EngineX."
             elif final_clicked and modal_still_open:
-                return False, "Clicked Grant Access but modal is still open — action likely did not register (form may be incomplete or validation failed)."
+                return False, "Clicked Grant Access but modal is still open — action likely did not register."
             else:
                 return False, "Could not click final 'Grant Access' button."
 
@@ -828,7 +800,6 @@ async def process_paid_order(order_id: str):
     else:
         update_order(order_id, status="failed")
 
-    # Notifie le salon staff
     if STAFF_CHANNEL_ID:
         channel = bot.get_channel(STAFF_CHANNEL_ID)
         if channel:
@@ -842,7 +813,6 @@ async def process_paid_order(order_id: str):
             embed.set_footer(text=f"Order ID: {order_id}")
             await channel.send(embed=embed)
 
-    # Notifie le client en DM
     buyer = bot.get_user(order["buyer_id"])
     if buyer:
         try:
@@ -878,9 +848,6 @@ def stripe_webhook():
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-
-        # session peut être un dict classique OU un objet Stripe selon le contexte;
-        # on récupère metadata de façon robuste dans les deux cas.
         metadata = session["metadata"] if "metadata" in session else {}
         order_id = metadata["order_id"] if metadata and "order_id" in metadata else None
 
@@ -969,7 +936,6 @@ async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
                         }}
                         const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer']");
                         if (input) {{
-                            // On a atteint la carte du modèle sans trouver l'ID dans son texte
                             return false;
                         }}
                     }}
@@ -1020,13 +986,11 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
                 await asyncio.sleep(3)
                 await page.wait_for_load_state("networkidle", timeout=30000)
 
-            # Le chip a un attribut data-testid au format "badge-share-{index}-{discordId}"
-            # On localise d'abord le titre du modèle, puis on remonte à un conteneur assez large
-            # pour englober les chips (souvent frères, pas descendants du titre lui-même)
             try:
                 title_el = page.locator(f"*:has-text('{model_name}')").last
                 model_card = title_el
                 chip_locator = None
+                count = 0
 
                 for _ in range(8):
                     chip_locator = model_card.locator(
@@ -1037,14 +1001,13 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
                         break
                     model_card = model_card.locator("xpath=..")
 
-                print(f"[Winsight Revoke] Found {count} matching chip(s) for discord_id={discord_id} within model card")
+                print(f"[Winsight Revoke] Found {count} matching chip(s) for discord_id={discord_id}")
 
                 if count == 0:
                     await browser.close()
                     return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}** on Winsight."
 
                 chip_locator = chip_locator.first
-
                 await chip_locator.click(timeout=5000)
                 result = "clicked"
             except Exception as e:
@@ -1124,11 +1087,7 @@ async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
 
 
 # ─────────────────────────────────────────────
-#  COMMANDES MANUELLES (/grantaccess, /checkaccess)
-# ─────────────────────────────────────────────
-
-# ─────────────────────────────────────────────
-#  COMMANDES MANUELLES (/grantaccess, /checkaccess) — avec autocomplete
+#  COMMANDES MANUELLES — avec autocomplete
 # ─────────────────────────────────────────────
 
 async def model_autocomplete(interaction: discord.Interaction, current: str):
@@ -1170,12 +1129,57 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
         else:
             success, message = await winsight_grant(contact, model)
 
-        embed = discord.Embed(
-            title="✅ Manual Grant Complete" if success else "❌ Manual Grant Failed",
-            description=message,
-            color=0x57F287 if success else 0xED4245,
-        )
+        if success:
+            # Titre style capture : "✅ WIN Granted — Model" ou "✅ EX Granted — Model"
+            if platform.value == "winsight":
+                title = f"✅ WIN Granted — {model}"
+            else:
+                title = f"✅ EX Granted — {model}"
+
+            embed = discord.Embed(title=title, color=0x57F287)
+            embed.description = f"✓ {model}"
+
+            if platform.value == "winsight":
+                embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
+            else:
+                # Pour EngineX on n'a pas de Discord ID, on affiche l'email
+                embed.add_field(name="Discord User", value=f"N/A (manual grant)", inline=False)
+                embed.add_field(name="EngineX Email", value=contact, inline=False)
+
+            embed.add_field(name="Result", value="1 granted", inline=False)
+            embed.set_footer(text=f"Manual Grant • by {interaction.user}")
+        else:
+            title = "❌ Manual Grant Failed"
+            embed = discord.Embed(
+                title=title,
+                description=message,
+                color=0xED4245,
+            )
+
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+        # Poster aussi dans le salon staff si configuré
+        if STAFF_CHANNEL_ID:
+            channel = bot.get_channel(STAFF_CHANNEL_ID)
+            if channel:
+                if success:
+                    staff_embed = discord.Embed(title=title, color=0x57F287)
+                    staff_embed.description = f"✓ {model}"
+                    if platform.value == "winsight":
+                        staff_embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
+                    else:
+                        staff_embed.add_field(name="Discord User", value=f"N/A (manual grant)", inline=False)
+                        staff_embed.add_field(name="EngineX Email", value=contact, inline=False)
+                    staff_embed.add_field(name="Result", value="1 granted — Manual", inline=False)
+                    staff_embed.set_footer(text=f"Granted by {interaction.user} • Manual")
+                else:
+                    staff_embed = discord.Embed(
+                        title="❌ Manual Grant Failed",
+                        description=message,
+                        color=0xED4245,
+                    )
+                    staff_embed.set_footer(text=f"Attempted by {interaction.user}")
+                await channel.send(embed=staff_embed)
 
     asyncio.create_task(run_grant())
 
