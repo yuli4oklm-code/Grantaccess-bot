@@ -1504,7 +1504,7 @@ async def winsight_revoke_pipeline(discord_id: str, pipeline_site_name: str) -> 
 
             if revoke_result["status"] == "pipeline_not_found":
                 await browser.close()
-                titles_str = ", ".join(f"{{t['title']}} (has_id: {{t['hasDiscordId']}})" for t in all_titles) or "aucune"
+                titles_str = ", ".join(f"{t['title']} (has_id: {t['hasDiscordId']})" for t in all_titles) or "aucune"
                 return False, f"❌ Pipeline `{pipeline_site_name}` introuvable. Cards visibles: {titles_str}"
             if revoke_result["status"] == "user_not_found":
                 await browser.close()
