@@ -568,17 +568,9 @@ class TicketCloseView(discord.ui.View):
 
     @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="ticket_close")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Seul le staff (admin) ou l'owner peut fermer
         is_admin = interaction.user.guild_permissions.administrator
-
-        # Récupérer le owner_id depuis le topic du salon (format: "... | <user_id>")
-        owner_id = self.owner_id
-        if not owner_id:
-            topic = interaction.channel.topic or ""
-            match = re.search(r'\|\s*(\d+)\s*$', topic)
-            if match:
-                owner_id = int(match.group(1))
-
-        is_owner = interaction.user.id == owner_id
+        is_owner = interaction.user.id == self.owner_id
 
         if not is_admin and not is_owner:
             await interaction.response.send_message("❌ You can't close this ticket.", ephemeral=True)
@@ -596,31 +588,30 @@ class TicketCloseView(discord.ui.View):
 #  WEIGHT MODAL
 # ─────────────────────────────────────────────
 
-class WeightStep2View(discord.ui.View):
-    """Vue intermédiaire affichée après l'étape 1, avec bouton pour ouvrir l'étape 2."""
-
-    def __init__(self, weight_id: str, weight_data: dict):
-        super().__init__(timeout=300)
-        self.weight_id = weight_id
-        self.weight_data = weight_data
-
-    @discord.ui.button(label="➡️ Continuer — Specs & Plateformes", style=discord.ButtonStyle.primary)
-    async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Recharger les données fraîches depuis le fichier
-        weights = load_weights()
-        weight_data = weights.get(self.weight_id, self.weight_data)
-        modal = WeightMetaSpecsModal(weight_id=self.weight_id, weight_data=weight_data)
-        await interaction.response.send_modal(modal)
-
-
-class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
+class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
 
     def __init__(self, weight_id: str = None, existing: dict = None):
         super().__init__()
         self.weight_id = weight_id
 
+        # Reconstruire le champ multi-info si édition
+        image_default = ""
+        if existing:
+            parts = []
+            if existing.get("image_url"):
+                parts.append(f"image: {existing['image_url']}")
+            if existing.get("platforms"):
+                parts.append(f"platforms: {','.join(existing['platforms'])}")
+            if existing.get("version"):
+                parts.append(f"version: {existing['version']}")
+            if existing.get("author"):
+                parts.append(f"author: {existing['author']}")
+            if existing.get("product_model"):
+                parts.append(f"model: {existing['product_model']}")
+            image_default = "\n".join(parts)
+
         self.name_input = discord.ui.TextInput(
-            label="Weight name",
+            label="Weight name (ex: Rankzilla)",
             max_length=100,
             required=True,
             placeholder="Rankzilla",
@@ -630,7 +621,7 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
             label="Description",
             style=discord.TextStyle.paragraph,
             max_length=300,
-            required=False,
+            required=True,
             placeholder="Pure ranked dataset, optimized for CDL maps...",
             default=existing.get("description", "") if existing else "",
         )
@@ -642,18 +633,19 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
             default=existing.get("game", "") if existing else "",
         )
         self.price_input = discord.ui.TextInput(
-            label="Price display",
+            label="Price display (ex: $30 USD)",
             max_length=100,
             required=False,
             placeholder="$30 USD",
             default=existing.get("price_display", "") if existing else "",
         )
         self.image_input = discord.ui.TextInput(
-            label="Image URL (direct link)",
-            max_length=500,
+            label="Image URL + platforms + version + author",
+            style=discord.TextStyle.paragraph,
+            max_length=800,
             required=False,
-            placeholder="https://i.imgur.com/xxxx.png",
-            default=existing.get("image_url", "") if existing else "",
+            placeholder="image: https://...\nplatforms: ae,win,ex\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
+            default=image_default,
         )
 
         self.add_item(self.name_input)
@@ -663,126 +655,18 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
         self.add_item(self.image_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        image_url = self.image_input.value.strip()
-
-        weight_data = {
-            "name": self.name_input.value.strip(),
-            "description": self.description_input.value.strip(),
-            "game": self.game_input.value.strip(),
-            "price_display": self.price_input.value.strip(),
-            "image_url": image_url,
-            "platforms": [],
-            "version": "",
-            "author": "",
-            "product_model": "",
-            "specs_general": "",
-            "specs_ae": "",
-            "specs_win": "",
-            "specs_ex": "",
-        }
-
-        weights = load_weights()
-        if self.weight_id and self.weight_id in weights:
-            old = weights[self.weight_id]
-            for key in ["platforms", "version", "author", "product_model",
-                        "specs_general", "specs_ae", "specs_win", "specs_ex"]:
-                weight_data[key] = old.get(key, weight_data[key])
-
-        if not self.weight_id:
-            weight_id = re.sub(r'[^a-z0-9_]', '_', weight_data["name"].lower())
-            weight_id = f"{weight_id}_{int(time.time())}"
-        else:
-            weight_id = self.weight_id
-
-        weights[weight_id] = weight_data
-        save_weights(weights)
-
-        # Répondre avec un bouton pour ouvrir l'étape 2
-        view = WeightStep2View(weight_id, weight_data)
-        await interaction.response.send_message(
-            f"✅ **Étape 1 enregistrée !** Clique sur le bouton pour remplir les specs et plateformes.",
-            view=view,
-            ephemeral=True,
-        )
-
-
-class WeightMetaSpecsModal(discord.ui.Modal, title="Add / Edit Weight — Step 2/2"):
-    """Étape 2 : platforms/version/author/model + specs."""
-
-    def __init__(self, weight_id: str, weight_data: dict):
-        super().__init__()
-        self.weight_id = weight_id
-
-        # Reconstruire le champ meta
-        meta_default = ""
-        parts = []
-        if weight_data.get("platforms"):
-            parts.append(f"platforms: {','.join(weight_data['platforms'])}")
-        if weight_data.get("version"):
-            parts.append(f"version: {weight_data['version']}")
-        if weight_data.get("author"):
-            parts.append(f"author: {weight_data['author']}")
-        if weight_data.get("product_model"):
-            parts.append(f"model: {weight_data['product_model']}")
-        meta_default = "\n".join(parts)
-
-        self.meta_input = discord.ui.TextInput(
-            label="Platforms / Version / Author / Model",
-            style=discord.TextStyle.paragraph,
-            max_length=300,
-            required=False,
-            placeholder="platforms: ae,win,ex\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
-            default=meta_default,
-        )
-        self.specs_general = discord.ui.TextInput(
-            label="General specs",
-            style=discord.TextStyle.paragraph,
-            max_length=800,
-            required=False,
-            placeholder="• Support Team Ignore\n• FOV: 120\n• Enemy color: FF00FF",
-            default=weight_data.get("specs_general", ""),
-        )
-        self.specs_ae = discord.ui.TextInput(
-            label="AE specs",
-            style=discord.TextStyle.paragraph,
-            max_length=400,
-            required=False,
-            placeholder="• Model config: [2,0]\n• Class 2: ~72%\n• Confidence: 40%",
-            default=weight_data.get("specs_ae", ""),
-        )
-        self.specs_win = discord.ui.TextInput(
-            label="WIN specs",
-            style=discord.TextStyle.paragraph,
-            max_length=400,
-            required=False,
-            placeholder="• Target Classes: 2,0\n• Confidence: 50%",
-            default=weight_data.get("specs_win", ""),
-        )
-        self.specs_ex = discord.ui.TextInput(
-            label="EX specs",
-            style=discord.TextStyle.paragraph,
-            max_length=400,
-            required=False,
-            placeholder="• ...",
-            default=weight_data.get("specs_ex", ""),
-        )
-
-        self.add_item(self.meta_input)
-        self.add_item(self.specs_general)
-        self.add_item(self.specs_ae)
-        self.add_item(self.specs_win)
-        self.add_item(self.specs_ex)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # Parser le champ meta
+        # Parser le champ multi-info
+        image_url = ""
         platforms = []
         version = ""
         author = ""
         product_model = ""
 
-        for line in self.meta_input.value.strip().splitlines():
+        for line in self.image_input.value.strip().splitlines():
             line = line.strip()
-            if line.lower().startswith("platforms:"):
+            if line.lower().startswith("image:"):
+                image_url = line[6:].strip()
+            elif line.lower().startswith("platforms:"):
                 raw = line[10:].strip()
                 platforms = [p.strip().lower() for p in raw.split(",") if p.strip()]
             elif line.lower().startswith("version:"):
@@ -792,35 +676,112 @@ class WeightMetaSpecsModal(discord.ui.Modal, title="Add / Edit Weight — Step 2
             elif line.lower().startswith("model:"):
                 product_model = line[6:].strip()
 
-        weights = load_weights()
-        if self.weight_id not in weights:
-            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
-            return
-
-        weights[self.weight_id].update({
+        weight_data = {
+            "name": self.name_input.value.strip(),
+            "description": self.description_input.value.strip(),
+            "game": self.game_input.value.strip(),
+            "price_display": self.price_input.value.strip(),
+            "image_url": image_url,
             "platforms": platforms,
             "version": version,
             "author": author,
             "product_model": product_model,
-            "specs_general": self.specs_general.value.strip(),
-            "specs_ae": self.specs_ae.value.strip(),
-            "specs_win": self.specs_win.value.strip(),
-            "specs_ex": self.specs_ex.value.strip(),
-        })
+            # Specs vides par défaut (à remplir avec /weightspecs)
+            "specs_general": "",
+            "specs_ae": "",
+            "specs_win": "",
+            "specs_ex": "",
+        }
+
+        weights = load_weights()
+        # Conserver les specs existantes si on édite
+        if self.weight_id and self.weight_id in weights:
+            for key in ["specs_general", "specs_ae", "specs_win", "specs_ex"]:
+                weight_data[key] = weights[self.weight_id].get(key, "")
+
+        if not self.weight_id:
+            # Générer un ID unique
+            weight_id = re.sub(r'[^a-z0-9_]', '_', weight_data["name"].lower())
+            weight_id = f"{weight_id}_{int(time.time())}"
+        else:
+            weight_id = self.weight_id
+
+        weights[weight_id] = weight_data
         save_weights(weights)
 
-        weight_data = weights[self.weight_id]
         embed = build_weight_embed(weight_data)
-        view = WeightView(self.weight_id)
+        view = WeightView(weight_id)
 
         await interaction.response.send_message(
-            f"✅ Weight **{weight_data['name']}** saved!",
+            f"✅ Weight **{weight_data['name']}** saved! Preview:",
             embed=embed,
             view=view,
             ephemeral=True,
         )
 
 
+class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
+
+    def __init__(self, weight_id: str, existing: dict = None):
+        super().__init__()
+        self.weight_id = weight_id
+
+        self.specs_general = discord.ui.TextInput(
+            label="General specs",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+            required=False,
+            placeholder="• Support Team Ignore\n• FOV: 120 (recommended)\n...",
+            default=existing.get("specs_general", "") if existing else "",
+        )
+        self.specs_ae = discord.ui.TextInput(
+            label="AE specs",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=False,
+            placeholder="• Model config: [2,0]\n• Class 2: ~72%\n...",
+            default=existing.get("specs_ae", "") if existing else "",
+        )
+        self.specs_win = discord.ui.TextInput(
+            label="WIN specs",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=False,
+            placeholder="• Target Classes: 2,0\n• Confidence: 50%\n...",
+            default=existing.get("specs_win", "") if existing else "",
+        )
+        self.specs_ex = discord.ui.TextInput(
+            label="EX specs",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=False,
+            placeholder="• ...",
+            default=existing.get("specs_ex", "") if existing else "",
+        )
+
+        self.add_item(self.specs_general)
+        self.add_item(self.specs_ae)
+        self.add_item(self.specs_win)
+        self.add_item(self.specs_ex)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        weights = load_weights()
+        if self.weight_id not in weights:
+            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+            return
+
+        weights[self.weight_id]["specs_general"] = self.specs_general.value.strip()
+        weights[self.weight_id]["specs_ae"] = self.specs_ae.value.strip()
+        weights[self.weight_id]["specs_win"] = self.specs_win.value.strip()
+        weights[self.weight_id]["specs_ex"] = self.specs_ex.value.strip()
+        save_weights(weights)
+
+        embed = build_specs_embed(weights[self.weight_id])
+        await interaction.response.send_message(
+            f"✅ Specs updated for **{weights[self.weight_id]['name']}**! Preview:",
+            embed=embed,
+            ephemeral=True,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -871,7 +832,7 @@ async def weightadd_cmd(interaction: discord.Interaction, weight_id: str = None)
     await interaction.response.send_modal(modal)
 
 
-@tree.command(name="weightspecs", description="Éditer les specs/meta d'un weight (étape 2)")
+@tree.command(name="weightspecs", description="Éditer les specs d'un weight")
 @app_commands.describe(weight_id="Le weight dont tu veux éditer les specs")
 @app_commands.autocomplete(weight_id=weight_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
@@ -881,7 +842,7 @@ async def weightspecs_cmd(interaction: discord.Interaction, weight_id: str):
     if not weight_data:
         await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
         return
-    modal = WeightMetaSpecsModal(weight_id=weight_id, weight_data=weight_data)
+    modal = WeightSpecsModal(weight_id=weight_id, existing=weight_data)
     await interaction.response.send_modal(modal)
 
 
@@ -1416,214 +1377,11 @@ async def winsight_grant_all(discord_id: str, model_names: list[str]) -> tuple[i
     return successes, failures, details
 
 
-async def _pipeline_find_card(page, pipeline_site_name: str) -> dict:
-    """
-    Cherche la card de pipeline dont le titre correspond à pipeline_site_name.
-    AND sur chaque mot du keyword. Utilise innerText du titre h-tag ou premier span/div significatif.
-    """
-    words = [w.lower() for w in pipeline_site_name.strip().split() if w]
-    words_js = json.dumps(words)
-
-    # Debug : récupère tous les titres visibles (via h1-h6 ou premier élément texte non-bouton)
-    all_titles = await page.evaluate(f"""
-        () => {{
-            const words = {words_js};
-            const inputs = document.querySelectorAll(
-                "input[placeholder*='Discord'], input[placeholder*='discord'], " +
-                "input[placeholder*='Customer'], input[placeholder*='customer'], " +
-                "input[placeholder*='Username'], input[placeholder*='username']"
-            );
-            const results = [];
-            for (const input of inputs) {{
-                let card = input;
-                for (let i = 0; i < 10; i++) {{
-                    card = card.parentElement;
-                    if (!card) break;
-                    const buttons = card.querySelectorAll("button");
-                    let hasShare = false;
-                    for (const btn of buttons) {{
-                        if (btn.textContent.toUpperCase().trim() === "SHARE") {{ hasShare = true; break; }}
-                    }}
-                    if (!hasShare) continue;
-                    // Cherche un heading d'abord, sinon premier élément non-bouton/non-input avec du texte
-                    let title = "";
-                    const heading = card.querySelector("h1,h2,h3,h4,h5,h6");
-                    if (heading) {{
-                        title = heading.textContent.trim();
-                    }} else {{
-                        const children = card.querySelectorAll("span,div,p,strong,b");
-                        for (const el of children) {{
-                            const tag = el.tagName.toUpperCase();
-                            if (tag === "BUTTON" || tag === "INPUT") continue;
-                            const t = el.textContent.trim();
-                            if (t.length > 2 && t.length < 100) {{ title = t; break; }}
-                        }}
-                    }}
-                    const allMatch = words.every(w => title.toLowerCase().includes(w));
-                    results.push({{ title, match: allMatch }});
-                    break;
-                }}
-            }}
-            return results;
-        }}
-    """)
-
-    print(f"[Pipeline] Cards: {all_titles}")
-
-    match_result = await page.evaluate(f"""
-        () => {{
-            const words = {words_js};
-            const inputs = document.querySelectorAll(
-                "input[placeholder*='Discord'], input[placeholder*='discord'], " +
-                "input[placeholder*='Customer'], input[placeholder*='customer'], " +
-                "input[placeholder*='Username'], input[placeholder*='username']"
-            );
-            for (const input of inputs) {{
-                let card = input;
-                for (let i = 0; i < 10; i++) {{
-                    card = card.parentElement;
-                    if (!card) break;
-                    const buttons = card.querySelectorAll("button");
-                    let shareBtn = null;
-                    for (const btn of buttons) {{
-                        if (btn.textContent.toUpperCase().trim() === "SHARE") {{ shareBtn = btn; break; }}
-                    }}
-                    if (!shareBtn) continue;
-                    let title = "";
-                    const heading = card.querySelector("h1,h2,h3,h4,h5,h6");
-                    if (heading) {{
-                        title = heading.textContent.trim();
-                    }} else {{
-                        const children = card.querySelectorAll("span,div,p,strong,b");
-                        for (const el of children) {{
-                            const tag = el.tagName.toUpperCase();
-                            if (tag === "BUTTON" || tag === "INPUT") continue;
-                            const t = el.textContent.trim();
-                            if (t.length > 2 && t.length < 100) {{ title = t; break; }}
-                        }}
-                    }}
-                    if (!words.every(w => title.toLowerCase().includes(w))) break;
-                    input.setAttribute("data-pipe-input", "true");
-                    shareBtn.setAttribute("data-pipe-btn", "true");
-                    return {{ status: "found", title }};
-                }}
-            }}
-            return {{ status: "not_found" }};
-        }}
-    """)
-
-    print(f"[Pipeline] Match: {match_result}")
-    return match_result, [r["title"] for r in all_titles]
-
-
 async def winsight_grant_pipeline(discord_id: str, pipeline_site_name: str) -> tuple[bool, str]:
-    print(f"[Pipeline Grant] discord_id={discord_id}, pipeline='{pipeline_site_name}'")
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await _winsight_login(page)
-            result, all_titles = await _pipeline_find_card(page, pipeline_site_name)
-            if result["status"] != "found":
-                await browser.close()
-                return False, f"❌ Pipeline `{pipeline_site_name}` introuvable. Titres visibles: {all_titles}"
-            input_locator = page.locator("[data-pipe-input='true']")
-            await input_locator.click()
-            await input_locator.fill("")
-            await input_locator.type(discord_id, delay=30)
-            await asyncio.sleep(0.5)
-            share_btn = page.locator("[data-pipe-btn='true']")
-            await share_btn.click()
-            await asyncio.sleep(2)
-            await browser.close()
-            return True, f"✅ `{discord_id}` ajouté à **{result['title']}**."
-    except Exception as e:
-        return False, f"Error: {str(e)}"
-
-
-async def winsight_revoke_pipeline(discord_id: str, pipeline_site_name: str) -> tuple[bool, str]:
-    print(f"[Pipeline Revoke] discord_id={discord_id}, pipeline='{pipeline_site_name}'")
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await _winsight_login(page)
-            result, all_titles = await _pipeline_find_card(page, pipeline_site_name)
-            if result["status"] != "found":
-                await browser.close()
-                return False, f"❌ Pipeline `{pipeline_site_name}` introuvable. Titres: {all_titles}"
-            title = result["title"]
-            import json as _json
-            words_js = _json.dumps([w.lower() for w in pipeline_site_name.strip().split() if w])
-            revoke_result = await page.evaluate(f"""
-                () => {{
-                    const words = {words_js};
-                    const discordId = "{discord_id}";
-                    const inputs = document.querySelectorAll(
-                        "input[placeholder*='Discord'], input[placeholder*='discord'], " +
-                        "input[placeholder*='Customer'], input[placeholder*='customer'], " +
-                        "input[placeholder*='Username'], input[placeholder*='username']"
-                    );
-                    for (const input of inputs) {{
-                        let card = input;
-                        for (let i = 0; i < 10; i++) {{
-                            card = card.parentElement;
-                            if (!card) break;
-                            const buttons = card.querySelectorAll("button");
-                            let hasShare = false;
-                            for (const btn of buttons) {{
-                                if (btn.textContent.toUpperCase().trim() === "SHARE") {{ hasShare = true; break; }}
-                            }}
-                            if (!hasShare) continue;
-                            const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-                            let cardTitle = "";
-                            let node;
-                            while (node = walker.nextNode()) {{
-                                const t = node.textContent.trim();
-                                if (t.length > 2) {{ cardTitle = t; break; }}
-                            }}
-                            if (!words.every(w => cardTitle.toLowerCase().includes(w))) break;
-                            if (!card.textContent.includes(discordId)) {{
-                                return {{ status: "user_not_found", title: cardTitle }};
-                            }}
-                            const allEls = card.querySelectorAll("*");
-                            for (const el of allEls) {{
-                                if (el.children.length > 0) continue;
-                                if (!el.textContent.includes(discordId)) continue;
-                                let chip = el;
-                                for (let j = 0; j < 4; j++) {{
-                                    chip = chip.parentElement;
-                                    if (!chip) break;
-                                    const close = chip.querySelector("button, [role='button'], svg");
-                                    if (close) {{
-                                        close.setAttribute("data-pipe-revoke", "true");
-                                        return {{ status: "found", title: cardTitle }};
-                                    }}
-                                }}
-                            }}
-                            return {{ status: "revoke_btn_not_found", title: cardTitle }};
-                        }}
-                    }}
-                    return {{ status: "pipeline_not_found" }};
-                }}
-            """)
-            print(f"[Pipeline Revoke] result: {revoke_result}")
-            if revoke_result["status"] == "user_not_found":
-                await browser.close()
-                return False, f"❌ `{discord_id}` n'a pas accès à **{title}**."
-            if revoke_result["status"] == "revoke_btn_not_found":
-                await browser.close()
-                return False, f"❌ Bouton × introuvable pour `{discord_id}` dans **{title}**."
-            if revoke_result["status"] != "found":
-                await browser.close()
-                return False, f"❌ Erreur: {revoke_result['status']}."
-            revoke_btn = page.locator("[data-pipe-revoke='true']").first
-            await revoke_btn.click(timeout=5000)
-            await asyncio.sleep(2)
-            await browser.close()
-            return True, f"✅ `{discord_id}` retiré de **{title}**."
-    except Exception as e:
-        return False, f"Error: {str(e)}"
+    success, message = await winsight_grant(discord_id, pipeline_site_name)
+    if success:
+        return True, f"Pipeline access granted to {discord_id} for {pipeline_site_name} on Winsight."
+    return False, message
 
 
 async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
@@ -2057,34 +1815,7 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
     asyncio.create_task(run())
 
 
-@tree.command(name="revokepipe", description="Retirer une pipeline Winsight d'un utilisateur")
-@app_commands.autocomplete(pipeline=pipeline_autocomplete)
-@app_commands.checks.has_permissions(administrator=True)
-async def revokepipe_cmd(interaction: discord.Interaction, pipeline: str, discord_id: str):
-    pipelines = load_pipelines()
-    if pipeline not in pipelines:
-        await interaction.response.send_message(
-            f"❌ Pipeline **{pipeline}** introuvable.", ephemeral=False
-        )
-        return
-    site_name = pipelines[pipeline]
-    await interaction.response.send_message(
-        f"⏳ Revoking pipeline **{pipeline}** from `{discord_id}`...", ephemeral=False
-    )
-
-    async def run():
-        success, message = await winsight_revoke_pipeline(discord_id, site_name)
-        embed = discord.Embed(
-            title=f"✅ Pipeline Revoked — {pipeline}" if success else "❌ Pipeline Revoke Failed",
-            description=message,
-            color=0x57F287 if success else 0xED4245,
-        )
-        embed.add_field(name="User", value=f"<@{discord_id}> ({discord_id})", inline=False)
-        embed.add_field(name="Winsight Name", value=site_name, inline=False)
-        embed.set_footer(text=f"Pipeline Revoke • by {interaction.user}")
-        await interaction.followup.send(embed=embed, ephemeral=False)
-
-    asyncio.create_task(run())
+@tree.command(name="grantaccess", description="Donner manuellement l'accès à un jeu (toutes versions d'un coup)")
 @app_commands.describe(
     model="Le jeu à donner (ex: Valorant → grant toutes les versions Valorant)",
     platform="La plateforme",
