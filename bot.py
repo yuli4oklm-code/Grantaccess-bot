@@ -340,39 +340,35 @@ ORDER_EMBED_DESCRIPTION = (
 # ─────────────────────────────────────────────
 
 def build_weight_embed(weight_data: dict) -> discord.Embed:
-    """Construit l'embed d'affichage d'un weight (style screenshot)."""
-    name = weight_data.get("name", "Unknown")
+    """Construit l'embed d'affichage d'un weight — style propre proche du screenshot Rankzilla."""
+    name        = weight_data.get("name", "Unknown")
     description = weight_data.get("description", "")
-    game = weight_data.get("game", "")
+    game        = weight_data.get("game", "")
     price_display = weight_data.get("price_display", "")
-    platforms = weight_data.get("platforms", [])
-    version = weight_data.get("version", "")
-    author = weight_data.get("author", "")
-    image_url = weight_data.get("image_url", "")
+    platforms   = weight_data.get("platforms", [])
+    version     = weight_data.get("version", "")
+    author      = weight_data.get("author", "")
+    image_url   = weight_data.get("image_url", "")
 
-    # Plateformes avec couleurs style "AE • WIN • EX"
-    platform_str = " • ".join(p.upper() for p in platforms) if platforms else ""
+    embed = discord.Embed(title=name, description=description or None, color=0x5865F2)
 
-    embed = discord.Embed(color=0x5865F2)
-    embed.title = f"**{name}**"
-
-    lines = []
-    if description:
-        lines.append(description)
-    lines.append("")
-
+    # Game + Platforms sur la même ligne (deux inline fields)
     if game:
-        lines.append(f"🎮 **Game**\n{game}")
+        embed.add_field(name="🎮 Game", value=game, inline=True)
 
-    if platform_str:
-        lines.append(f"🖥️ **Platforms**\n{platform_str}")
+    if platforms:
+        platform_str = " • ".join(p.upper() for p in platforms)
+        embed.add_field(name="🖥️ Platforms", value=platform_str, inline=True)
 
+    # Saut de ligne visuel si on a deux colonnes
+    if game and platforms:
+        embed.add_field(name="\u200b", value="\u200b", inline=False)
+
+    # Prix + Includes sur la même ligne
     if price_display:
-        lines.append(f"💰 **Price**\n{price_display}")
+        embed.add_field(name="💰 Price", value=price_display, inline=True)
 
-    lines.append("📦 **Includes**\n• All current and future versions")
-
-    embed.description = "\n\n".join(lines)
+    embed.add_field(name="📦 Includes", value="• All current and future versions", inline=True)
 
     if version or author:
         footer_parts = []
@@ -1264,12 +1260,101 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
         return False, f"Error: {str(e)}"
 
 
-async def winsight_grant_all(discord_id: str, model_names: list[str]) -> tuple[int, int, list[str]]:
+async def _winsight_scrape_matching(page, keyword: str) -> list[str]:
     """
-    Grant plusieurs modèles en une seule session browser.
+    Scrape la page Winsight connectée et retourne les noms exacts de toutes les
+    weights dont le nom contient `keyword` (insensible à la casse).
+    Cherche les éléments qui ont un input 'username/customer' + bouton 'SHARE' à proximité.
+    """
+    found_names = await page.evaluate(f"""
+        () => {{
+            const keyword = "{keyword}".toLowerCase();
+            const results = [];
+
+            // Cherche tous les éléments dont le texte direct contient le keyword
+            const allElements = document.querySelectorAll("*");
+            for (const el of allElements) {{
+                let directText = "";
+                for (const node of el.childNodes) {{
+                    if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
+                }}
+                const normalized = directText.toLowerCase().replace(/[_\\-\\s]/g, "");
+                const keyNorm   = keyword.replace(/[_\\-\\s]/g, "");
+                if (!normalized.includes(keyNorm)) continue;
+
+                // Vérifie que ce nœud est bien la "card" d'une weight
+                // (un parent proche contient un input username + bouton SHARE)
+                let parent = el;
+                for (let i = 0; i < 12; i++) {{
+                    parent = parent.parentElement;
+                    if (!parent) break;
+                    const input = parent.querySelector(
+                        "input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']"
+                    );
+                    const buttons = parent.querySelectorAll("button");
+                    let hasShare = false;
+                    for (const btn of buttons) {{
+                        if (btn.textContent.toUpperCase().includes("SHARE")) {{ hasShare = true; break; }}
+                    }}
+                    if (input && hasShare) {{
+                        const name = directText.trim();
+                        if (name && !results.includes(name)) results.push(name);
+                        break;
+                    }}
+                }}
+            }}
+            return results;
+        }}
+    """)
+    print(f"[Winsight Scrape] keyword='{keyword}' → found: {found_names}")
+    return found_names
+
+
+async def winsight_grant_all_dynamic(discord_id: str, keyword: str) -> tuple[int, int, list[str]]:
+    """
+    Ouvre Winsight, scrape dynamiquement toutes les weights dont le nom contient
+    `keyword`, puis les grant toutes en une seule session browser.
     Retourne (nb_success, nb_fail, detail_lines).
     """
-    print(f"[Winsight] Grant ALL: discord_id={discord_id}, models={model_names}")
+    print(f"[Winsight] Grant ALL dynamic: discord_id={discord_id}, keyword='{keyword}'")
+    successes = 0
+    failures = 0
+    details = []
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await _winsight_login(page)
+
+            # Scrape les noms réels sur la page
+            matching_names = await _winsight_scrape_matching(page, keyword)
+
+            if not matching_names:
+                await browser.close()
+                return 0, 0, [f"⚠️ Aucune weight contenant « {keyword} » trouvée sur Winsight."]
+
+            # Grant chacune dans la même session
+            for name in matching_names:
+                ok, msg = await _winsight_grant_one(page, discord_id, name)
+                if ok:
+                    successes += 1
+                else:
+                    failures += 1
+                details.append(msg)
+
+            await browser.close()
+    except Exception as e:
+        details.append(f"Browser error: {str(e)}")
+        failures = max(1, failures)
+    return successes, failures, details
+
+
+async def winsight_grant_all(discord_id: str, model_names: list[str]) -> tuple[int, int, list[str]]:
+    """
+    Grant une liste fixe de modèles en une seule session browser.
+    Utilisé pour les grants via Stripe (liste connue à l'avance).
+    """
+    print(f"[Winsight] Grant ALL (fixed list): discord_id={discord_id}, models={model_names}")
     successes = 0
     failures = 0
     details = []
@@ -1740,7 +1825,7 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
-    # model est ici le nom de groupe (ex: "Valorant")
+    # model est le nom de groupe (ex: "Valorant") — sert de keyword de recherche
     group_name = model
     available_platforms = get_platforms_for_group(group_name)
 
@@ -1752,27 +1837,18 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
         )
         return
 
-    # Récupérer tous les modèles du groupe pour cette plateforme
-    all_models = get_models_for_group(group_name)
-    products = load_products()
-    models_on_platform = [m for m in all_models if platform.value in products.get(m, {})]
-
-    if not models_on_platform:
-        await interaction.response.send_message(
-            f"❌ No models found for **{group_name}** on **{platform.name}**.", ephemeral=True
-        )
-        return
-
-    versions_str = ", ".join(get_display_name(m) for m in models_on_platform)
     await interaction.response.send_message(
-        f"⏳ Granting **{group_name}** ({len(models_on_platform)} version(s): {versions_str}) "
-        f"on **{platform.name}** to `{contact}`...",
-        ephemeral=True,
+        f"⏳ Searching Winsight for all weights containing **{group_name}** "
+        f"and granting to `{contact}`...",
+        ephemeral=False,
     )
 
     async def run():
         if platform.value == "enginex":
-            # EngineX : grant une version à la fois (flow différent)
+            # EngineX : liste fixe depuis products.json (pas de scraping live)
+            all_models = get_models_for_group(group_name)
+            products = load_products()
+            models_on_platform = [m for m in all_models if platform.value in products.get(m, {})]
             results = []
             total_ok = 0
             for m in models_on_platform:
@@ -1784,8 +1860,9 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
             nb_fail = len(models_on_platform) - total_ok
             details = results
         else:
-            # Winsight : tout en une session browser
-            nb_ok, nb_fail, details = await winsight_grant_all(contact, models_on_platform)
+            # Winsight : scraping dynamique — trouve toutes les weights
+            # dont le nom contient group_name sur la page, peu importe la version
+            nb_ok, nb_fail, details = await winsight_grant_all_dynamic(contact, group_name)
 
         all_ok = nb_fail == 0
         color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
@@ -1817,11 +1894,10 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
         )
         embed.set_footer(text=f"Manual Grant • by {interaction.user}")
 
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        if STAFF_CHANNEL_ID:
-            channel = bot.get_channel(STAFF_CHANNEL_ID)
-            if channel:
-                await channel.send(embed=embed)
+        # Poster publiquement dans le salon où la commande a été faite
+        await interaction.channel.send(embed=embed)
+        # Confirmer à l'auteur que c'est envoyé (ephemeral, juste pour lui)
+        await interaction.followup.send("✅ Result posted above.", ephemeral=True)
 
     asyncio.create_task(run())
 
