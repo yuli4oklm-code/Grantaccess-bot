@@ -1400,6 +1400,48 @@ async def winsight_revoke_pipeline(discord_id: str, pipeline_site_name: str) -> 
             words = [w.lower() for w in pipeline_site_name.strip().split() if w]
             words_js = json.dumps(words)
 
+            # Debug : lister tous les titres visibles (même logique que grant)
+            all_titles = await page.evaluate(f"""
+                () => {{
+                    const inputs = document.querySelectorAll(
+                        "input[placeholder*='Discord'], input[placeholder*='discord'], " +
+                        "input[placeholder*='Customer'], input[placeholder*='customer'], " +
+                        "input[placeholder*='Username'], input[placeholder*='username']"
+                    );
+                    const results = [];
+                    for (const input of inputs) {{
+                        let card = input;
+                        for (let i = 0; i < 10; i++) {{
+                            card = card.parentElement;
+                            if (!card) break;
+                            const buttons = card.querySelectorAll("button");
+                            let hasShare = false;
+                            for (const btn of buttons) {{
+                                if (btn.textContent.toUpperCase().trim() === "SHARE") {{ hasShare = true; break; }}
+                            }}
+                            if (!hasShare) continue;
+                            let title = "";
+                            const heading = card.querySelector("h1,h2,h3,h4,h5,h6");
+                            if (heading) {{
+                                title = heading.textContent.trim();
+                            }} else {{
+                                const children = card.querySelectorAll("span,div,p,strong,b");
+                                for (const el of children) {{
+                                    const tag = el.tagName.toUpperCase();
+                                    if (tag === "BUTTON" || tag === "INPUT") continue;
+                                    const t = el.textContent.trim();
+                                    if (t.length > 2 && t.length < 100) {{ title = t; break; }}
+                                }}
+                            }}
+                            results.push({{ title, hasDiscordId: card.textContent.includes("{discord_id}") }});
+                            break;
+                        }}
+                    }}
+                    return results;
+                }}
+            """)
+            print(f"[Pipeline Revoke] Visible cards: {all_titles}")
+
             revoke_result = await page.evaluate(f"""
                 () => {{
                     const words = {words_js};
@@ -1460,6 +1502,10 @@ async def winsight_revoke_pipeline(discord_id: str, pipeline_site_name: str) -> 
             """)
             print(f"[Pipeline Revoke] result: {revoke_result}")
 
+            if revoke_result["status"] == "pipeline_not_found":
+                await browser.close()
+                titles_str = ", ".join(f"{{t['title']}} (has_id: {{t['hasDiscordId']}})" for t in all_titles) or "aucune"
+                return False, f"❌ Pipeline `{pipeline_site_name}` introuvable. Cards visibles: {titles_str}"
             if revoke_result["status"] == "user_not_found":
                 await browser.close()
                 return False, f"❌ `{discord_id}` n'a pas accès à **{revoke_result['title']}**."
@@ -1681,38 +1727,134 @@ async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
         return False, f"Error: {str(e)}"
 
 
+async def _winsight_revoke_one(page, discord_id: str, model_name: str) -> tuple[bool, str]:
+    """
+    Retire discord_id de la card correspondant à model_name.
+    Trouve la card (comme _winsight_grant_one), puis cherche le chip contenant
+    discord_id à l'intérieur et clique son bouton de suppression (x / bin icon).
+    """
+    result = await page.evaluate(f"""
+        () => {{
+            document.querySelectorAll("[data-bot-revoke-btn]").forEach(el => el.removeAttribute("data-bot-revoke-btn"));
+
+            const modelName = "{model_name}".toLowerCase();
+            const discordId = "{discord_id}";
+            const allElements = document.querySelectorAll("*");
+            let matchEl = null;
+            for (const el of allElements) {{
+                let directText = "";
+                for (const node of el.childNodes) {{
+                    if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
+                }}
+                const normalized = directText.toLowerCase().replace(/[_\\-]/g, "");
+                const searchNorm = modelName.replace(/[_\\-]/g, "");
+                if (normalized.includes(searchNorm)) {{ matchEl = el; break; }}
+            }}
+            if (!matchEl) return {{ status: "not_found" }};
+
+            // Remonte jusqu'à la card contenant l'input + bouton SHARE
+            let card = matchEl;
+            for (let i = 0; i < 12; i++) {{
+                card = card.parentElement;
+                if (!card) break;
+                const input = card.querySelector("input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']");
+                const buttons = card.querySelectorAll("button");
+                let hasShare = false;
+                for (const btn of buttons) {{
+                    if (btn.textContent.toUpperCase().includes("SHARE")) {{ hasShare = true; break; }}
+                }}
+                if (input && hasShare) break;
+            }}
+            if (!card) return {{ status: "card_not_found" }};
+
+            if (!card.textContent.includes(discordId)) {{
+                return {{ status: "user_not_found" }};
+            }}
+
+            // Cherche l'élément feuille contenant l'ID Discord, remonte pour trouver un bouton/svg cliquable
+            const allEls = card.querySelectorAll("*");
+            for (const el of allEls) {{
+                if (el.children.length > 0) continue;  // feuilles seulement
+                if (!el.textContent.includes(discordId)) continue;
+                let chip = el;
+                for (let j = 0; j < 5; j++) {{
+                    chip = chip.parentElement;
+                    if (!chip) break;
+                    const close = chip.querySelector("button, [role='button'], svg");
+                    if (close) {{
+                        close.setAttribute("data-bot-revoke-btn", "true");
+                        return {{ status: "found" }};
+                    }}
+                }}
+            }}
+            return {{ status: "revoke_btn_not_found" }};
+        }}
+    """)
+
+    if result["status"] == "found":
+        btn = page.locator("[data-bot-revoke-btn='true']").first
+        await btn.click(timeout=5000)
+        await asyncio.sleep(1.5)
+        return True, f"✓ {model_name}"
+    elif result["status"] == "not_found":
+        return False, f"✗ {model_name} (introuvable sur la page)"
+    elif result["status"] == "card_not_found":
+        return False, f"✗ {model_name} (card introuvable)"
+    elif result["status"] == "user_not_found":
+        return False, f"✗ {model_name} (l'utilisateur n'a pas accès)"
+    else:
+        return False, f"✗ {model_name} (bouton de suppression introuvable)"
+
+
 async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
+    print(f"[Winsight Revoke] discord_id={discord_id}, model={model_name}")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             await _winsight_login(page)
-            try:
-                title_el = page.locator(f"*:has-text('{model_name}')").last
-                model_card = title_el
-                chip_locator = None
-                count = 0
-                for _ in range(8):
-                    chip_locator = model_card.locator(f"[data-testid*='badge-share'][data-testid*='{discord_id}']")
-                    count = await chip_locator.count()
-                    if count > 0:
-                        break
-                    model_card = model_card.locator("xpath=..")
-                if count == 0:
-                    await browser.close()
-                    return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}**."
-                await chip_locator.first.click(timeout=5000)
-                result = "clicked"
-            except Exception:
-                result = "click_failed"
-            await asyncio.sleep(2)
+            ok, msg = await _winsight_revoke_one(page, discord_id, model_name)
             await browser.close()
-            if result == "clicked":
+            if ok:
                 return True, f"✅ Access revoked for {discord_id} on **{model_name}**."
-            else:
-                return False, "❌ Found chip but couldn't click remove."
+            return False, msg
     except Exception as e:
         return False, f"Error: {str(e)}"
+
+
+async def winsight_revoke_all_dynamic(discord_id: str, keyword: str) -> tuple[int, int, list[str]]:
+    """
+    Scrape toutes les weights dont le nom contient `keyword` (comme grantaccess),
+    et révoque l'accès de discord_id pour chacune, en une seule session browser.
+    """
+    print(f"[Winsight] Revoke ALL dynamic: discord_id={discord_id}, keyword='{keyword}'")
+    successes = 0
+    failures = 0
+    details = []
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await _winsight_login(page)
+
+            matching_names = await _winsight_scrape_matching(page, keyword)
+            if not matching_names:
+                await browser.close()
+                return 0, 0, [f"⚠️ Aucune weight contenant « {keyword} » trouvée sur Winsight."]
+
+            for name in matching_names:
+                ok, msg = await _winsight_revoke_one(page, discord_id, name)
+                if ok:
+                    successes += 1
+                else:
+                    failures += 1
+                details.append(msg)
+
+            await browser.close()
+    except Exception as e:
+        details.append(f"Browser error: {str(e)}")
+        failures = max(1, failures)
+    return successes, failures, details
 
 
 async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
@@ -1982,38 +2124,37 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run())
 
 
-@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight uniquement)")
+@tree.command(name="revoke", description="Retirer l'accès d'un client à un jeu (toutes versions trouvées sur Winsight)")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str):
     group_name = model
-    available_platforms = get_platforms_for_group(group_name)
-    if "winsight" not in available_platforms:
-        await interaction.response.send_message(f"❌ **{group_name}** not on Winsight.", ephemeral=True)
-        return
-    all_models = get_models_for_group(group_name)
-    products = load_products()
-    models_on_winsight = [m for m in all_models if "winsight" in products.get(m, {})]
+
     await interaction.response.send_message(
-        f"⏳ Revoking **{group_name}** ({len(models_on_winsight)} version(s)) for `{contact}`...", ephemeral=True
+        f"⏳ Searching Winsight for all weights containing **{group_name}** and revoking from `{contact}`...",
+        ephemeral=False,
     )
 
     async def run():
-        lines = []
-        nb_ok = 0
-        for m in models_on_winsight:
-            ok, msg = await winsight_revoke(contact, m)
-            lines.append(f"{'✓' if ok else '✗'} {get_display_name(m)}: {msg}")
-            if ok:
-                nb_ok += 1
-        nb_fail = len(models_on_winsight) - nb_ok
-        embed = discord.Embed(
-            title=f"{'✅' if nb_fail == 0 else '⚠️'} Revoke — {group_name}",
-            description="\n".join(lines),
-            color=0x57F287 if nb_fail == 0 else 0xF1C40F,
-        )
+        nb_ok, nb_fail, details = await winsight_revoke_all_dynamic(contact, group_name)
+        all_ok = nb_fail == 0 and nb_ok > 0
+        color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
+
+        if all_ok:
+            title = f"✅ Revoked — {group_name}"
+        elif nb_ok > 0:
+            title = f"⚠️ Partial Revoke — {group_name}"
+        else:
+            title = f"❌ Revoke Failed — {group_name}"
+
+        embed = discord.Embed(title=title, color=color)
+        embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
         embed.add_field(name="Result", value=f"{nb_ok} revoked, {nb_fail} failed", inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        embed.add_field(name="Details", value="\n".join(details) or "—", inline=False)
+        embed.set_footer(text=f"Manual Revoke • by {interaction.user}")
+
+        await interaction.channel.send(embed=embed)
+        await interaction.followup.send("✅ Result posted above.", ephemeral=True)
 
     asyncio.create_task(run())
 
