@@ -568,9 +568,17 @@ class TicketCloseView(discord.ui.View):
 
     @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="ticket_close")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Seul le staff (admin) ou l'owner peut fermer
         is_admin = interaction.user.guild_permissions.administrator
-        is_owner = interaction.user.id == self.owner_id
+
+        # Récupérer le owner_id depuis le topic du salon (format: "... | <user_id>")
+        owner_id = self.owner_id
+        if not owner_id:
+            topic = interaction.channel.topic or ""
+            match = re.search(r'\|\s*(\d+)\s*$', topic)
+            if match:
+                owner_id = int(match.group(1))
+
+        is_owner = interaction.user.id == owner_id
 
         if not is_admin and not is_owner:
             await interaction.response.send_message("❌ You can't close this ticket.", ephemeral=True)
@@ -588,18 +596,16 @@ class TicketCloseView(discord.ui.View):
 #  WEIGHT MODAL
 # ─────────────────────────────────────────────
 
-class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
+class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
 
     def __init__(self, weight_id: str = None, existing: dict = None):
         super().__init__()
         self.weight_id = weight_id
 
-        # Reconstruire le champ multi-info si édition
-        image_default = ""
+        # Reconstruire le champ meta si édition
+        meta_default = ""
         if existing:
             parts = []
-            if existing.get("image_url"):
-                parts.append(f"image: {existing['image_url']}")
             if existing.get("platforms"):
                 parts.append(f"platforms: {','.join(existing['platforms'])}")
             if existing.get("version"):
@@ -608,10 +614,10 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
                 parts.append(f"author: {existing['author']}")
             if existing.get("product_model"):
                 parts.append(f"model: {existing['product_model']}")
-            image_default = "\n".join(parts)
+            meta_default = "\n".join(parts)
 
         self.name_input = discord.ui.TextInput(
-            label="Weight name (ex: Rankzilla)",
+            label="Weight name",
             max_length=100,
             required=True,
             placeholder="Rankzilla",
@@ -621,7 +627,7 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
             label="Description",
             style=discord.TextStyle.paragraph,
             max_length=300,
-            required=True,
+            required=False,
             placeholder="Pure ranked dataset, optimized for CDL maps...",
             default=existing.get("description", "") if existing else "",
         )
@@ -633,19 +639,19 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
             default=existing.get("game", "") if existing else "",
         )
         self.price_input = discord.ui.TextInput(
-            label="Price display (ex: $30 USD)",
+            label="Price display",
             max_length=100,
             required=False,
             placeholder="$30 USD",
             default=existing.get("price_display", "") if existing else "",
         )
+        # Champ dédié à l'image URL uniquement
         self.image_input = discord.ui.TextInput(
-            label="Image URL + platforms + version + author",
-            style=discord.TextStyle.paragraph,
-            max_length=800,
+            label="Image URL (direct link)",
+            max_length=500,
             required=False,
-            placeholder="image: https://...\nplatforms: ae,win,ex\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
-            default=image_default,
+            placeholder="https://i.imgur.com/xxxx.png",
+            default=existing.get("image_url", "") if existing else "",
         )
 
         self.add_item(self.name_input)
@@ -655,18 +661,123 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
         self.add_item(self.image_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Parser le champ multi-info
-        image_url = ""
+        image_url = self.image_input.value.strip()
+
+        weight_data = {
+            "name": self.name_input.value.strip(),
+            "description": self.description_input.value.strip(),
+            "game": self.game_input.value.strip(),
+            "price_display": self.price_input.value.strip(),
+            "image_url": image_url,
+            # Conservé depuis l'existant ou vide — rempli à l'étape 2
+            "platforms": [],
+            "version": "",
+            "author": "",
+            "product_model": "",
+            "specs_general": "",
+            "specs_ae": "",
+            "specs_win": "",
+            "specs_ex": "",
+        }
+
+        weights = load_weights()
+        # Conserver les champs qu'on ne touche pas à l'étape 1
+        if self.weight_id and self.weight_id in weights:
+            old = weights[self.weight_id]
+            for key in ["platforms", "version", "author", "product_model",
+                        "specs_general", "specs_ae", "specs_win", "specs_ex"]:
+                weight_data[key] = old.get(key, weight_data[key])
+
+        if not self.weight_id:
+            weight_id = re.sub(r'[^a-z0-9_]', '_', weight_data["name"].lower())
+            weight_id = f"{weight_id}_{int(time.time())}"
+        else:
+            weight_id = self.weight_id
+
+        weights[weight_id] = weight_data
+        save_weights(weights)
+
+        # Enchaîner automatiquement sur l'étape 2 (meta + specs)
+        await interaction.response.send_modal(WeightMetaSpecsModal(weight_id, weight_data))
+
+
+class WeightMetaSpecsModal(discord.ui.Modal, title="Add / Edit Weight — Step 2/2"):
+    """Étape 2 : platforms/version/author/model + specs."""
+
+    def __init__(self, weight_id: str, weight_data: dict):
+        super().__init__()
+        self.weight_id = weight_id
+
+        # Reconstruire le champ meta
+        meta_default = ""
+        parts = []
+        if weight_data.get("platforms"):
+            parts.append(f"platforms: {','.join(weight_data['platforms'])}")
+        if weight_data.get("version"):
+            parts.append(f"version: {weight_data['version']}")
+        if weight_data.get("author"):
+            parts.append(f"author: {weight_data['author']}")
+        if weight_data.get("product_model"):
+            parts.append(f"model: {weight_data['product_model']}")
+        meta_default = "\n".join(parts)
+
+        self.meta_input = discord.ui.TextInput(
+            label="Platforms / Version / Author / Model",
+            style=discord.TextStyle.paragraph,
+            max_length=300,
+            required=False,
+            placeholder="platforms: ae,win,ex\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
+            default=meta_default,
+        )
+        self.specs_general = discord.ui.TextInput(
+            label="General specs",
+            style=discord.TextStyle.paragraph,
+            max_length=800,
+            required=False,
+            placeholder="• Support Team Ignore\n• FOV: 120\n• Enemy color: FF00FF",
+            default=weight_data.get("specs_general", ""),
+        )
+        self.specs_ae = discord.ui.TextInput(
+            label="AE specs",
+            style=discord.TextStyle.paragraph,
+            max_length=400,
+            required=False,
+            placeholder="• Model config: [2,0]\n• Class 2: ~72%\n• Confidence: 40%",
+            default=weight_data.get("specs_ae", ""),
+        )
+        self.specs_win = discord.ui.TextInput(
+            label="WIN specs",
+            style=discord.TextStyle.paragraph,
+            max_length=400,
+            required=False,
+            placeholder="• Target Classes: 2,0\n• Confidence: 50%",
+            default=weight_data.get("specs_win", ""),
+        )
+        self.specs_ex = discord.ui.TextInput(
+            label="EX specs",
+            style=discord.TextStyle.paragraph,
+            max_length=400,
+            required=False,
+            placeholder="• ...",
+            default=weight_data.get("specs_ex", ""),
+        )
+
+        self.add_item(self.meta_input)
+        self.add_item(self.specs_general)
+        self.add_item(self.specs_ae)
+        self.add_item(self.specs_win)
+        self.add_item(self.specs_ex)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Parser le champ meta
         platforms = []
         version = ""
         author = ""
         product_model = ""
 
-        for line in self.image_input.value.strip().splitlines():
+        for line in self.meta_input.value.strip().splitlines():
             line = line.strip()
-            if line.lower().startswith("image:"):
-                image_url = line[6:].strip()
-            elif line.lower().startswith("platforms:"):
+            if line.lower().startswith("platforms:"):
                 raw = line[10:].strip()
                 platforms = [p.strip().lower() for p in raw.split(",") if p.strip()]
             elif line.lower().startswith("version:"):
@@ -676,112 +787,35 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
             elif line.lower().startswith("model:"):
                 product_model = line[6:].strip()
 
-        weight_data = {
-            "name": self.name_input.value.strip(),
-            "description": self.description_input.value.strip(),
-            "game": self.game_input.value.strip(),
-            "price_display": self.price_input.value.strip(),
-            "image_url": image_url,
+        weights = load_weights()
+        if self.weight_id not in weights:
+            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+            return
+
+        weights[self.weight_id].update({
             "platforms": platforms,
             "version": version,
             "author": author,
             "product_model": product_model,
-            # Specs vides par défaut (à remplir avec /weightspecs)
-            "specs_general": "",
-            "specs_ae": "",
-            "specs_win": "",
-            "specs_ex": "",
-        }
-
-        weights = load_weights()
-        # Conserver les specs existantes si on édite
-        if self.weight_id and self.weight_id in weights:
-            for key in ["specs_general", "specs_ae", "specs_win", "specs_ex"]:
-                weight_data[key] = weights[self.weight_id].get(key, "")
-
-        if not self.weight_id:
-            # Générer un ID unique
-            weight_id = re.sub(r'[^a-z0-9_]', '_', weight_data["name"].lower())
-            weight_id = f"{weight_id}_{int(time.time())}"
-        else:
-            weight_id = self.weight_id
-
-        weights[weight_id] = weight_data
+            "specs_general": self.specs_general.value.strip(),
+            "specs_ae": self.specs_ae.value.strip(),
+            "specs_win": self.specs_win.value.strip(),
+            "specs_ex": self.specs_ex.value.strip(),
+        })
         save_weights(weights)
 
+        weight_data = weights[self.weight_id]
         embed = build_weight_embed(weight_data)
-        view = WeightView(weight_id)
+        view = WeightView(self.weight_id)
 
         await interaction.response.send_message(
-            f"✅ Weight **{weight_data['name']}** saved! Preview:",
+            f"✅ Weight **{weight_data['name']}** saved!",
             embed=embed,
             view=view,
             ephemeral=True,
         )
 
 
-class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
-
-    def __init__(self, weight_id: str, existing: dict = None):
-        super().__init__()
-        self.weight_id = weight_id
-
-        self.specs_general = discord.ui.TextInput(
-            label="General specs",
-            style=discord.TextStyle.paragraph,
-            max_length=1000,
-            required=False,
-            placeholder="• Support Team Ignore\n• FOV: 120 (recommended)\n...",
-            default=existing.get("specs_general", "") if existing else "",
-        )
-        self.specs_ae = discord.ui.TextInput(
-            label="AE specs",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            required=False,
-            placeholder="• Model config: [2,0]\n• Class 2: ~72%\n...",
-            default=existing.get("specs_ae", "") if existing else "",
-        )
-        self.specs_win = discord.ui.TextInput(
-            label="WIN specs",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            required=False,
-            placeholder="• Target Classes: 2,0\n• Confidence: 50%\n...",
-            default=existing.get("specs_win", "") if existing else "",
-        )
-        self.specs_ex = discord.ui.TextInput(
-            label="EX specs",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            required=False,
-            placeholder="• ...",
-            default=existing.get("specs_ex", "") if existing else "",
-        )
-
-        self.add_item(self.specs_general)
-        self.add_item(self.specs_ae)
-        self.add_item(self.specs_win)
-        self.add_item(self.specs_ex)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        weights = load_weights()
-        if self.weight_id not in weights:
-            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
-            return
-
-        weights[self.weight_id]["specs_general"] = self.specs_general.value.strip()
-        weights[self.weight_id]["specs_ae"] = self.specs_ae.value.strip()
-        weights[self.weight_id]["specs_win"] = self.specs_win.value.strip()
-        weights[self.weight_id]["specs_ex"] = self.specs_ex.value.strip()
-        save_weights(weights)
-
-        embed = build_specs_embed(weights[self.weight_id])
-        await interaction.response.send_message(
-            f"✅ Specs updated for **{weights[self.weight_id]['name']}**! Preview:",
-            embed=embed,
-            ephemeral=True,
-        )
 
 
 # ─────────────────────────────────────────────
@@ -832,7 +866,7 @@ async def weightadd_cmd(interaction: discord.Interaction, weight_id: str = None)
     await interaction.response.send_modal(modal)
 
 
-@tree.command(name="weightspecs", description="Éditer les specs d'un weight")
+@tree.command(name="weightspecs", description="Éditer les specs/meta d'un weight (étape 2)")
 @app_commands.describe(weight_id="Le weight dont tu veux éditer les specs")
 @app_commands.autocomplete(weight_id=weight_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
@@ -842,7 +876,7 @@ async def weightspecs_cmd(interaction: discord.Interaction, weight_id: str):
     if not weight_data:
         await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
         return
-    modal = WeightSpecsModal(weight_id=weight_id, existing=weight_data)
+    modal = WeightMetaSpecsModal(weight_id=weight_id, weight_data=weight_data)
     await interaction.response.send_modal(modal)
 
 
