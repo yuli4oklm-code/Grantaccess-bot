@@ -596,25 +596,28 @@ class TicketCloseView(discord.ui.View):
 #  WEIGHT MODAL
 # ─────────────────────────────────────────────
 
+class WeightStep2View(discord.ui.View):
+    """Vue intermédiaire affichée après l'étape 1, avec bouton pour ouvrir l'étape 2."""
+
+    def __init__(self, weight_id: str, weight_data: dict):
+        super().__init__(timeout=300)
+        self.weight_id = weight_id
+        self.weight_data = weight_data
+
+    @discord.ui.button(label="➡️ Continuer — Specs & Plateformes", style=discord.ButtonStyle.primary)
+    async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Recharger les données fraîches depuis le fichier
+        weights = load_weights()
+        weight_data = weights.get(self.weight_id, self.weight_data)
+        modal = WeightMetaSpecsModal(weight_id=self.weight_id, weight_data=weight_data)
+        await interaction.response.send_modal(modal)
+
+
 class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
 
     def __init__(self, weight_id: str = None, existing: dict = None):
         super().__init__()
         self.weight_id = weight_id
-
-        # Reconstruire le champ meta si édition
-        meta_default = ""
-        if existing:
-            parts = []
-            if existing.get("platforms"):
-                parts.append(f"platforms: {','.join(existing['platforms'])}")
-            if existing.get("version"):
-                parts.append(f"version: {existing['version']}")
-            if existing.get("author"):
-                parts.append(f"author: {existing['author']}")
-            if existing.get("product_model"):
-                parts.append(f"model: {existing['product_model']}")
-            meta_default = "\n".join(parts)
 
         self.name_input = discord.ui.TextInput(
             label="Weight name",
@@ -645,7 +648,6 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
             placeholder="$30 USD",
             default=existing.get("price_display", "") if existing else "",
         )
-        # Champ dédié à l'image URL uniquement
         self.image_input = discord.ui.TextInput(
             label="Image URL (direct link)",
             max_length=500,
@@ -669,7 +671,6 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
             "game": self.game_input.value.strip(),
             "price_display": self.price_input.value.strip(),
             "image_url": image_url,
-            # Conservé depuis l'existant ou vide — rempli à l'étape 2
             "platforms": [],
             "version": "",
             "author": "",
@@ -681,7 +682,6 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
         }
 
         weights = load_weights()
-        # Conserver les champs qu'on ne touche pas à l'étape 1
         if self.weight_id and self.weight_id in weights:
             old = weights[self.weight_id]
             for key in ["platforms", "version", "author", "product_model",
@@ -697,8 +697,13 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight — Step 1/2"):
         weights[weight_id] = weight_data
         save_weights(weights)
 
-        # Enchaîner automatiquement sur l'étape 2 (meta + specs)
-        await interaction.response.send_modal(WeightMetaSpecsModal(weight_id, weight_data))
+        # Répondre avec un bouton pour ouvrir l'étape 2
+        view = WeightStep2View(weight_id, weight_data)
+        await interaction.response.send_message(
+            f"✅ **Étape 1 enregistrée !** Clique sur le bouton pour remplir les specs et plateformes.",
+            view=view,
+            ephemeral=True,
+        )
 
 
 class WeightMetaSpecsModal(discord.ui.Modal, title="Add / Edit Weight — Step 2/2"):
@@ -1849,7 +1854,34 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
     asyncio.create_task(run())
 
 
-@tree.command(name="grantaccess", description="Donner manuellement l'accès à un jeu (toutes versions d'un coup)")
+@tree.command(name="revokepipe", description="Retirer une pipeline Winsight d'un utilisateur")
+@app_commands.autocomplete(pipeline=pipeline_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def revokepipe_cmd(interaction: discord.Interaction, pipeline: str, discord_id: str):
+    pipelines = load_pipelines()
+    if pipeline not in pipelines:
+        await interaction.response.send_message(
+            f"❌ Pipeline **{pipeline}** introuvable.", ephemeral=False
+        )
+        return
+    site_name = pipelines[pipeline]
+    await interaction.response.send_message(
+        f"⏳ Revoking pipeline **{pipeline}** from `{discord_id}`...", ephemeral=False
+    )
+
+    async def run():
+        success, message = await winsight_revoke(discord_id, site_name)
+        embed = discord.Embed(
+            title=f"✅ Pipeline Revoked — {pipeline}" if success else "❌ Pipeline Revoke Failed",
+            description=message,
+            color=0x57F287 if success else 0xED4245,
+        )
+        embed.add_field(name="User", value=f"<@{discord_id}> ({discord_id})", inline=False)
+        embed.add_field(name="Winsight Name", value=site_name, inline=False)
+        embed.set_footer(text=f"Pipeline Revoke • by {interaction.user}")
+        await interaction.followup.send(embed=embed, ephemeral=False)
+
+    asyncio.create_task(run())
 @app_commands.describe(
     model="Le jeu à donner (ex: Valorant → grant toutes les versions Valorant)",
     platform="La plateforme",
