@@ -593,48 +593,14 @@ class TicketCloseView(discord.ui.View):
 # ─────────────────────────────────────────────
 
 class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
-    name_input = discord.ui.TextInput(
-        label="Weight name (ex: Rankzilla)",
-        max_length=100,
-        required=True,
-        placeholder="Rankzilla",
-    )
-    description_input = discord.ui.TextInput(
-        label="Description",
-        style=discord.TextStyle.paragraph,
-        max_length=300,
-        required=True,
-        placeholder="Pure ranked dataset, optimized for CDL maps...",
-    )
-    game_input = discord.ui.TextInput(
-        label="Game",
-        max_length=100,
-        required=False,
-        placeholder="Call of Duty: Black Ops 7",
-    )
-    price_input = discord.ui.TextInput(
-        label="Price display (ex: $30 USD or ~~$40~~ $30 USD)",
-        max_length=100,
-        required=False,
-        placeholder="$30 USD",
-    )
-    image_input = discord.ui.TextInput(
-        label="Image URL + platforms + version + author",
-        style=discord.TextStyle.paragraph,
-        max_length=800,
-        required=False,
-        placeholder="image: https://...\nplatforms: ae,win,ex\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
-    )
 
     def __init__(self, weight_id: str = None, existing: dict = None):
         super().__init__()
         self.weight_id = weight_id
+
+        # Reconstruire le champ multi-info si édition
+        image_default = ""
         if existing:
-            self.name_input.default = existing.get("name", "")
-            self.description_input.default = existing.get("description", "")
-            self.game_input.default = existing.get("game", "")
-            self.price_input.default = existing.get("price_display", "")
-            # Reconstruire le champ image
             parts = []
             if existing.get("image_url"):
                 parts.append(f"image: {existing['image_url']}")
@@ -646,7 +612,51 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
                 parts.append(f"author: {existing['author']}")
             if existing.get("product_model"):
                 parts.append(f"model: {existing['product_model']}")
-            self.image_input.default = "\n".join(parts)
+            image_default = "\n".join(parts)
+
+        self.name_input = discord.ui.TextInput(
+            label="Weight name (ex: Rankzilla)",
+            max_length=100,
+            required=True,
+            placeholder="Rankzilla",
+            default=existing.get("name", "") if existing else "",
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Description",
+            style=discord.TextStyle.paragraph,
+            max_length=300,
+            required=True,
+            placeholder="Pure ranked dataset, optimized for CDL maps...",
+            default=existing.get("description", "") if existing else "",
+        )
+        self.game_input = discord.ui.TextInput(
+            label="Game",
+            max_length=100,
+            required=False,
+            placeholder="Call of Duty: Black Ops 7",
+            default=existing.get("game", "") if existing else "",
+        )
+        self.price_input = discord.ui.TextInput(
+            label="Price display (ex: $30 USD)",
+            max_length=100,
+            required=False,
+            placeholder="$30 USD",
+            default=existing.get("price_display", "") if existing else "",
+        )
+        self.image_input = discord.ui.TextInput(
+            label="Image URL + platforms + version + author",
+            style=discord.TextStyle.paragraph,
+            max_length=800,
+            required=False,
+            placeholder="image: https://...\nplatforms: ae,win,ex\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
+            default=image_default,
+        )
+
+        self.add_item(self.name_input)
+        self.add_item(self.description_input)
+        self.add_item(self.game_input)
+        self.add_item(self.price_input)
+        self.add_item(self.image_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         # Parser le champ multi-info
@@ -715,43 +725,48 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
 
 
 class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
-    specs_general = discord.ui.TextInput(
-        label="General specs",
-        style=discord.TextStyle.paragraph,
-        max_length=1000,
-        required=False,
-        placeholder="• Support Team Ignore\n• FOV: 120 (recommended)\n...",
-    )
-    specs_ae = discord.ui.TextInput(
-        label="AE specs",
-        style=discord.TextStyle.paragraph,
-        max_length=500,
-        required=False,
-        placeholder="• Model config: [2,0]\n• Class 2: ~72%\n...",
-    )
-    specs_win = discord.ui.TextInput(
-        label="WIN specs",
-        style=discord.TextStyle.paragraph,
-        max_length=500,
-        required=False,
-        placeholder="• Target Classes: 2,0\n• Confidence: 50%\n...",
-    )
-    specs_ex = discord.ui.TextInput(
-        label="EX specs",
-        style=discord.TextStyle.paragraph,
-        max_length=500,
-        required=False,
-        placeholder="• ...",
-    )
 
     def __init__(self, weight_id: str, existing: dict = None):
         super().__init__()
         self.weight_id = weight_id
-        if existing:
-            self.specs_general.default = existing.get("specs_general", "")
-            self.specs_ae.default = existing.get("specs_ae", "")
-            self.specs_win.default = existing.get("specs_win", "")
-            self.specs_ex.default = existing.get("specs_ex", "")
+
+        self.specs_general = discord.ui.TextInput(
+            label="General specs",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+            required=False,
+            placeholder="• Support Team Ignore\n• FOV: 120 (recommended)\n...",
+            default=existing.get("specs_general", "") if existing else "",
+        )
+        self.specs_ae = discord.ui.TextInput(
+            label="AE specs",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=False,
+            placeholder="• Model config: [2,0]\n• Class 2: ~72%\n...",
+            default=existing.get("specs_ae", "") if existing else "",
+        )
+        self.specs_win = discord.ui.TextInput(
+            label="WIN specs",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=False,
+            placeholder="• Target Classes: 2,0\n• Confidence: 50%\n...",
+            default=existing.get("specs_win", "") if existing else "",
+        )
+        self.specs_ex = discord.ui.TextInput(
+            label="EX specs",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=False,
+            placeholder="• ...",
+            default=existing.get("specs_ex", "") if existing else "",
+        )
+
+        self.add_item(self.specs_general)
+        self.add_item(self.specs_ae)
+        self.add_item(self.specs_win)
+        self.add_item(self.specs_ex)
 
     async def on_submit(self, interaction: discord.Interaction):
         weights = load_weights()
@@ -1175,7 +1190,7 @@ async def _winsight_login(page) -> bool:
 
 
 async def _winsight_grant_one(page, discord_id: str, model_name: str) -> tuple[bool, str]:
-    """Grant un seul modèle sur une page déjà connectée (pas de reload de login)."""
+    """Grant un seul modèle sur une page déjà connectée. Recherche insensible à la casse."""
     match_info = await page.evaluate(f"""
         () => {{
             // Reset previous markers
@@ -1190,7 +1205,10 @@ async def _winsight_grant_one(page, discord_id: str, model_name: str) -> tuple[b
                 for (const node of el.childNodes) {{
                     if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
                 }}
-                if (directText.toLowerCase().includes(modelName)) {{ matchEl = el; break; }}
+                // Comparaison insensible à la casse ET aux underscores/tirets
+                const normalized = directText.toLowerCase().replace(/[_\\-]/g, "");
+                const searchNorm = modelName.replace(/[_\\-]/g, "");
+                if (normalized.includes(searchNorm)) {{ matchEl = el; break; }}
             }}
             if (!matchEl) return {{ status: "not_found" }};
             let parent = matchEl;
@@ -1224,9 +1242,9 @@ async def _winsight_grant_one(page, discord_id: str, model_name: str) -> tuple[b
         await asyncio.sleep(1.5)
         return True, f"✓ {model_name}"
     elif match_info["status"] == "container_not_found":
-        return False, f"✗ {model_name} (found but no input/share button)"
+        return False, f"✗ {model_name} (trouvé mais pas d'input/share button)"
     else:
-        return False, f"✗ {model_name} (not found on page)"
+        return False, f"✗ {model_name} (introuvable sur la page)"
 
 
 async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
