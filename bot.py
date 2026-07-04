@@ -60,26 +60,65 @@ DEFAULT_PIPELINES = {}
 #  MAPPING NOM MODELE → DISPLAY NAME
 # ─────────────────────────────────────────────
 
+def strip_prefix(model_name: str) -> str:
+    """Retire les préfixes connus (XyCub, Moon, etc.)."""
+    prefixes = ["XyCub", "xycub", "Moon", "moon", "MOON"]
+    for prefix in prefixes:
+        if model_name.startswith(prefix):
+            return model_name[len(prefix):]
+    return model_name
+
+
 def get_display_name(model_name: str) -> str:
     """
     Transforme XyCubValorantV2 → Valorant V2, XyCubValorantV3 → Valorant V3, etc.
-    Règle : on retire les préfixes connus (XyCub, Moon, etc.) et on garde le reste lisible.
     """
-    name = model_name
-
-    # Retirer les préfixes connus
-    prefixes = ["XyCub", "xycub", "Moon", "moon", "MOON"]
-    for prefix in prefixes:
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-            break
-
-    # CamelCase → mots séparés : "ValorantV2" → "Valorant V2"
-    # Insère un espace avant chaque majuscule qui suit une minuscule, ou avant "V" suivi d'un chiffre
+    name = strip_prefix(model_name)
+    # CamelCase → mots séparés
     name = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
     name = re.sub(r'(?<=[a-zA-Z])(V\d+)', r' \1', name)
-
     return name.strip()
+
+
+def get_game_group(model_name: str) -> str:
+    """
+    Retourne le nom du 'jeu' sans numéro de version.
+    XyCubValorantV2 → "Valorant"
+    XyCubValorantV3 → "Valorant"
+    XyCubCODV1     → "COD"
+    Permet de regrouper toutes les versions d'un même jeu.
+    """
+    name = strip_prefix(model_name)
+    # CamelCase → mots
+    name = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
+    # Retirer le suffixe Vx (version)
+    name = re.sub(r'\s*V\d+\s*$', '', name).strip()
+    return name
+
+
+def get_models_for_group(group_name: str) -> list[str]:
+    """
+    Retourne tous les model_names dont le game_group correspond à group_name (insensible à la casse).
+    Ex: "Valorant" → ["XyCubValorantV2", "XyCubValorantV3"]
+    """
+    products = load_products()
+    return [
+        name for name in products.keys()
+        if get_game_group(name).lower() == group_name.lower()
+    ]
+
+
+def get_grouped_products() -> dict[str, list[str]]:
+    """
+    Retourne un dict {group_name: [model1, model2, ...]} groupé par jeu.
+    Ex: {"Valorant": ["XyCubValorantV2", "XyCubValorantV3"], "COD": [...]}
+    """
+    products = load_products()
+    groups: dict[str, list[str]] = {}
+    for name in products.keys():
+        group = get_game_group(name)
+        groups.setdefault(group, []).append(name)
+    return groups
 
 
 # ─────────────────────────────────────────────
@@ -1111,93 +1150,128 @@ async def productlist_cmd(interaction: discord.Interaction, public: bool = False
 #  AUTOMATISATION WINSIGHT (Playwright)
 # ─────────────────────────────────────────────
 
+async def _winsight_login(page) -> bool:
+    """Ouvre Winsight et se connecte si nécessaire. Retourne True si connecté."""
+    await page.goto(WINSIGHT_URL, timeout=30000)
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    login_input = await page.query_selector("input[type='text']")
+    if login_input:
+        await page.fill("input[type='text']", WINSIGHT_USERNAME)
+        await page.fill("input[type='password']", WINSIGHT_PASSWORD)
+        clicked = await page.evaluate("""
+            () => {
+                const buttons = document.querySelectorAll("button");
+                for (const btn of buttons) {
+                    if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
+                }
+                return false;
+            }
+        """)
+        if not clicked:
+            await page.click("text=SIGN IN", timeout=10000)
+        await asyncio.sleep(3)
+        await page.wait_for_load_state("networkidle", timeout=30000)
+    return True
+
+
+async def _winsight_grant_one(page, discord_id: str, model_name: str) -> tuple[bool, str]:
+    """Grant un seul modèle sur une page déjà connectée (pas de reload de login)."""
+    match_info = await page.evaluate(f"""
+        () => {{
+            // Reset previous markers
+            document.querySelectorAll("[data-bot-target-input]").forEach(el => el.removeAttribute("data-bot-target-input"));
+            document.querySelectorAll("[data-bot-target-button]").forEach(el => el.removeAttribute("data-bot-target-button"));
+
+            const modelName = "{model_name}".toLowerCase();
+            const allElements = document.querySelectorAll("*");
+            let matchEl = null;
+            for (const el of allElements) {{
+                let directText = "";
+                for (const node of el.childNodes) {{
+                    if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
+                }}
+                if (directText.toLowerCase().includes(modelName)) {{ matchEl = el; break; }}
+            }}
+            if (!matchEl) return {{ status: "not_found" }};
+            let parent = matchEl;
+            for (let i = 0; i < 12; i++) {{
+                parent = parent.parentElement;
+                if (!parent) break;
+                const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']");
+                const buttons = parent.querySelectorAll("button");
+                let shareBtn = null;
+                for (const btn of buttons) {{
+                    if (btn.textContent.toUpperCase().includes("SHARE")) {{ shareBtn = btn; break; }}
+                }}
+                if (input && shareBtn) {{
+                    input.setAttribute("data-bot-target-input", "true");
+                    shareBtn.setAttribute("data-bot-target-button", "true");
+                    return {{ status: "found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
+                }}
+            }}
+            return {{ status: "container_not_found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
+        }}
+    """)
+
+    if match_info["status"] == "found":
+        input_locator = page.locator("[data-bot-target-input='true']")
+        await input_locator.click()
+        await input_locator.fill("")
+        await input_locator.type(discord_id, delay=30)
+        await asyncio.sleep(0.5)
+        share_button = page.locator("[data-bot-target-button='true']")
+        await share_button.click()
+        await asyncio.sleep(1.5)
+        return True, f"✓ {model_name}"
+    elif match_info["status"] == "container_not_found":
+        return False, f"✗ {model_name} (found but no input/share button)"
+    else:
+        return False, f"✗ {model_name} (not found on page)"
+
+
 async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
-    print(f"[Winsight] Starting grant for discord_id={discord_id}, model={model_name}")
+    """Grant un seul modèle (ouvre et ferme son propre browser)."""
+    print(f"[Winsight] Grant: discord_id={discord_id}, model={model_name}")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-            await page.goto(WINSIGHT_URL, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-
-            login_input = await page.query_selector("input[type='text']")
-            if login_input:
-                await page.fill("input[type='text']", WINSIGHT_USERNAME)
-                await page.fill("input[type='password']", WINSIGHT_PASSWORD)
-                clicked = await page.evaluate("""
-                    () => {
-                        const buttons = document.querySelectorAll("button");
-                        for (const btn of buttons) {
-                            if (btn.textContent.toUpperCase().includes("SIGN IN")) {
-                                btn.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }
-                """)
-                if not clicked:
-                    await page.click("text=SIGN IN", timeout=10000)
-                await asyncio.sleep(3)
-                await page.wait_for_load_state("networkidle", timeout=30000)
-
-            match_info = await page.evaluate(f"""
-                () => {{
-                    const modelName = "{model_name}".toLowerCase();
-                    const allElements = document.querySelectorAll("*");
-                    let matchEl = null;
-                    for (const el of allElements) {{
-                        let directText = "";
-                        for (const node of el.childNodes) {{
-                            if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
-                        }}
-                        if (directText.toLowerCase().includes(modelName)) {{ matchEl = el; break; }}
-                    }}
-                    if (!matchEl) return {{ status: "not_found" }};
-                    let parent = matchEl;
-                    for (let i = 0; i < 12; i++) {{
-                        parent = parent.parentElement;
-                        if (!parent) break;
-                        const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']");
-                        const buttons = parent.querySelectorAll("button");
-                        let shareBtn = null;
-                        for (const btn of buttons) {{
-                            if (btn.textContent.toUpperCase().includes("SHARE")) {{ shareBtn = btn; break; }}
-                        }}
-                        if (input && shareBtn) {{
-                            input.setAttribute("data-bot-target-input", "true");
-                            shareBtn.setAttribute("data-bot-target-button", "true");
-                            return {{ status: "found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
-                        }}
-                    }}
-                    return {{ status: "container_not_found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
-                }}
-            """)
-
-            found = "not_found"
-            if match_info["status"] == "found":
-                input_locator = page.locator("[data-bot-target-input='true']")
-                await input_locator.click()
-                await input_locator.fill("")
-                await input_locator.type(discord_id, delay=30)
-                await asyncio.sleep(0.5)
-                share_button = page.locator("[data-bot-target-button='true']")
-                await share_button.click()
-                found = "clicked"
-            else:
-                found = match_info["status"]
-
-            await asyncio.sleep(2)
+            await _winsight_login(page)
+            success, msg = await _winsight_grant_one(page, discord_id, model_name)
             await browser.close()
-
-            if found == "clicked":
+            if success:
                 return True, f"Access granted to {discord_id} for {model_name} on Winsight."
-            elif found == "container_not_found":
-                return False, f"Found model '{model_name}' but couldn't locate input/share button."
-            else:
-                return False, f"Could not find model '{model_name}' on Winsight."
+            return False, msg
     except Exception as e:
         return False, f"Error: {str(e)}"
+
+
+async def winsight_grant_all(discord_id: str, model_names: list[str]) -> tuple[int, int, list[str]]:
+    """
+    Grant plusieurs modèles en une seule session browser.
+    Retourne (nb_success, nb_fail, detail_lines).
+    """
+    print(f"[Winsight] Grant ALL: discord_id={discord_id}, models={model_names}")
+    successes = 0
+    failures = 0
+    details = []
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await _winsight_login(page)
+            for model_name in model_names:
+                ok, msg = await _winsight_grant_one(page, discord_id, model_name)
+                if ok:
+                    successes += 1
+                else:
+                    failures += 1
+                details.append(msg)
+            await browser.close()
+    except Exception as e:
+        details.append(f"Browser error: {str(e)}")
+        failures += len(model_names) - successes
+    return successes, failures, details
 
 
 async def winsight_grant_pipeline(discord_id: str, pipeline_site_name: str) -> tuple[bool, str]:
@@ -1538,18 +1612,32 @@ async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────
 
 async def model_autocomplete(interaction: discord.Interaction, current: str):
-    products = load_products()
-    matches = [name for name in products.keys() if current.lower() in name.lower()]
-    return [
-        app_commands.Choice(name=get_display_name(name), value=name)
-        for name in matches[:25]
+    """
+    Autocomplete groupé par jeu : affiche "Valorant" (pas "Valorant V2" / "Valorant V3" séparément).
+    La value est le nom du groupe (ex: "Valorant").
+    """
+    groups = get_grouped_products()
+    matches = [
+        group for group in groups.keys()
+        if current.lower() in group.lower()
     ]
+    return [app_commands.Choice(name=group, value=group) for group in matches[:25]]
 
 
 async def pipeline_autocomplete(interaction: discord.Interaction, current: str):
     pipelines = load_pipelines()
     matches = [name for name in pipelines.keys() if current.lower() in name.lower()]
     return [app_commands.Choice(name=name, value=name) for name in matches[:25]]
+
+
+def get_platforms_for_group(group_name: str) -> list:
+    """Retourne toutes les plateformes disponibles pour un groupe (union de toutes les versions)."""
+    products = load_products()
+    models = get_models_for_group(group_name)
+    platforms = set()
+    for model in models:
+        platforms.update(products.get(model, {}).keys())
+    return list(platforms)
 
 
 def get_platforms_for_model(model_name: str) -> list:
@@ -1624,40 +1712,92 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
     asyncio.create_task(run())
 
 
-@tree.command(name="grantaccess", description="Donner manuellement l'accès à un modèle")
+@tree.command(name="grantaccess", description="Donner manuellement l'accès à un jeu (toutes versions d'un coup)")
+@app_commands.describe(
+    model="Le jeu à donner (ex: Valorant → grant toutes les versions Valorant)",
+    platform="La plateforme",
+    contact="ID Discord (Winsight) ou email (EngineX)",
+)
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
-    available = get_platforms_for_model(model)
-    if platform.value not in available:
+    # model est ici le nom de groupe (ex: "Valorant")
+    group_name = model
+    available_platforms = get_platforms_for_group(group_name)
+
+    if platform.value not in available_platforms:
         await interaction.response.send_message(
-            f"❌ **{get_display_name(model)}** not configured on **{platform.name}**.", ephemeral=True
+            f"❌ **{group_name}** not configured on **{platform.name}**. "
+            f"Available: {', '.join(available_platforms) or 'none'}",
+            ephemeral=True,
         )
         return
+
+    # Récupérer tous les modèles du groupe pour cette plateforme
+    all_models = get_models_for_group(group_name)
+    products = load_products()
+    models_on_platform = [m for m in all_models if platform.value in products.get(m, {})]
+
+    if not models_on_platform:
+        await interaction.response.send_message(
+            f"❌ No models found for **{group_name}** on **{platform.name}**.", ephemeral=True
+        )
+        return
+
+    versions_str = ", ".join(get_display_name(m) for m in models_on_platform)
     await interaction.response.send_message(
-        f"⏳ Granting **{get_display_name(model)}** on **{platform.name}** to `{contact}`...", ephemeral=True
+        f"⏳ Granting **{group_name}** ({len(models_on_platform)} version(s): {versions_str}) "
+        f"on **{platform.name}** to `{contact}`...",
+        ephemeral=True,
     )
 
     async def run():
         if platform.value == "enginex":
-            success, message = await enginex_grant(contact, model)
+            # EngineX : grant une version à la fois (flow différent)
+            results = []
+            total_ok = 0
+            for m in models_on_platform:
+                ok, msg = await enginex_grant(contact, m)
+                results.append(f"{'✓' if ok else '✗'} {get_display_name(m)}")
+                if ok:
+                    total_ok += 1
+            nb_ok = total_ok
+            nb_fail = len(models_on_platform) - total_ok
+            details = results
         else:
-            success, message = await winsight_grant(contact, model)
+            # Winsight : tout en une session browser
+            nb_ok, nb_fail, details = await winsight_grant_all(contact, models_on_platform)
 
-        display = get_display_name(model)
-        if success:
-            title = f"✅ {'WIN' if platform.value == 'winsight' else 'EX'} Granted — {display}"
-            embed = discord.Embed(title=title, color=0x57F287)
-            embed.description = f"✓ {display}"
-            if platform.value == "winsight":
-                embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
-            else:
-                embed.add_field(name="EngineX Email", value=contact, inline=False)
-            embed.add_field(name="Result", value="1 granted", inline=False)
-            embed.set_footer(text=f"Manual Grant • by {interaction.user}")
+        all_ok = nb_fail == 0
+        color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
+        prefix = "WIN" if platform.value == "winsight" else "EX"
+
+        if all_ok:
+            title = f"✅ {prefix} Granted — {group_name}"
+        elif nb_ok > 0:
+            title = f"⚠️ {prefix} Partial Grant — {group_name}"
         else:
-            embed = discord.Embed(title="❌ Manual Grant Failed", description=message, color=0xED4245)
+            title = f"❌ {prefix} Grant Failed — {group_name}"
+
+        embed = discord.Embed(title=title, color=color)
+
+        if platform.value == "winsight":
+            embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
+        else:
+            embed.add_field(name="EngineX Email", value=contact, inline=False)
+
+        embed.add_field(
+            name="Result",
+            value=f"{nb_ok} granted, {nb_fail} failed",
+            inline=False,
+        )
+        embed.add_field(
+            name="Details",
+            value="\n".join(details) or "—",
+            inline=False,
+        )
+        embed.set_footer(text=f"Manual Grant • by {interaction.user}")
 
         await interaction.followup.send(embed=embed, ephemeral=True)
         if STAFF_CHANNEL_ID:
@@ -1668,53 +1808,81 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run())
 
 
-@tree.command(name="checkaccess", description="Vérifier si un client a accès à un modèle")
+@tree.command(name="checkaccess", description="Vérifier si un client a accès à un jeu (toutes versions)")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
-    available = get_platforms_for_model(model)
-    if platform.value not in available:
+    group_name = model
+    available_platforms = get_platforms_for_group(group_name)
+    if platform.value not in available_platforms:
         await interaction.response.send_message(
-            f"❌ **{get_display_name(model)}** not configured on **{platform.name}**.", ephemeral=True
+            f"❌ **{group_name}** not configured on **{platform.name}**.", ephemeral=True
         )
         return
+
+    all_models = get_models_for_group(group_name)
+    products = load_products()
+    models_on_platform = [m for m in all_models if platform.value in products.get(m, {})]
+
     await interaction.response.send_message(
-        f"⏳ Checking **{get_display_name(model)}** for `{contact}`...", ephemeral=True
+        f"⏳ Checking **{group_name}** ({len(models_on_platform)} version(s)) for `{contact}`...", ephemeral=True
     )
 
     async def run():
-        if platform.value == "enginex":
-            success, message = await enginex_check(contact, model)
-        else:
-            success, message = await winsight_check(contact, model)
-        embed = discord.Embed(title="🔍 Access Check Result", description=message, color=0x5865F2)
+        lines = []
+        for m in models_on_platform:
+            if platform.value == "enginex":
+                _, msg = await enginex_check(contact, m)
+            else:
+                _, msg = await winsight_check(contact, m)
+            lines.append(f"**{get_display_name(m)}**: {msg}")
+        embed = discord.Embed(
+            title=f"🔍 Access Check — {group_name}",
+            description="\n".join(lines) or "No models found.",
+            color=0x5865F2,
+        )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     asyncio.create_task(run())
 
 
-@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight uniquement)")
+@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight uniquement, toutes versions)")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str):
-    available = get_platforms_for_model(model)
-    if "winsight" not in available:
+    group_name = model
+    available_platforms = get_platforms_for_group(group_name)
+    if "winsight" not in available_platforms:
         await interaction.response.send_message(
-            f"❌ **{get_display_name(model)}** not on Winsight.", ephemeral=True
+            f"❌ **{group_name}** not on Winsight.", ephemeral=True
         )
         return
+
+    all_models = get_models_for_group(group_name)
+    products = load_products()
+    models_on_winsight = [m for m in all_models if "winsight" in products.get(m, {})]
+
     await interaction.response.send_message(
-        f"⏳ Revoking **{get_display_name(model)}** for `{contact}`...", ephemeral=True
+        f"⏳ Revoking **{group_name}** ({len(models_on_winsight)} version(s)) for `{contact}`...", ephemeral=True
     )
 
     async def run():
-        success, message = await winsight_revoke(contact, model)
+        lines = []
+        nb_ok = 0
+        for m in models_on_winsight:
+            ok, msg = await winsight_revoke(contact, m)
+            lines.append(f"{'✓' if ok else '✗'} {get_display_name(m)}: {msg}")
+            if ok:
+                nb_ok += 1
+        nb_fail = len(models_on_winsight) - nb_ok
+        all_ok = nb_fail == 0
         embed = discord.Embed(
-            title="✅ Access Revoked" if success else "❌ Revoke Failed",
-            description=message,
-            color=0x57F287 if success else 0xED4245,
+            title=f"{'✅' if all_ok else '⚠️'} Revoke — {group_name}",
+            description="\n".join(lines),
+            color=0x57F287 if all_ok else 0xF1C40F,
         )
+        embed.add_field(name="Result", value=f"{nb_ok} revoked, {nb_fail} failed", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     asyncio.create_task(run())
