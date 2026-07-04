@@ -1416,231 +1416,213 @@ async def winsight_grant_all(discord_id: str, model_names: list[str]) -> tuple[i
     return successes, failures, details
 
 
+async def _pipeline_find_card(page, pipeline_site_name: str) -> dict:
+    """
+    Cherche la card de pipeline dont le titre correspond le mieux à pipeline_site_name.
+    Stratégie : cherche chaque mot du keyword séparément dans le titre (AND),
+    ce qui évite que "apex cubis" matche "Drakoniz Apex".
+    """
+    # Mots-clés : on split par espace pour faire un AND sur chaque mot
+    words = [w.lower() for w in pipeline_site_name.strip().split() if w]
+    words_js = json.dumps(words)
+
+    all_titles = await page.evaluate(f"""
+        () => {{
+            const words = {words_js};
+            const inputs = document.querySelectorAll(
+                "input[placeholder*='Discord'], input[placeholder*='discord'], " +
+                "input[placeholder*='Customer'], input[placeholder*='customer'], " +
+                "input[placeholder*='Username'], input[placeholder*='username']"
+            );
+            const results = [];
+            for (const input of inputs) {{
+                let card = input;
+                for (let i = 0; i < 10; i++) {{
+                    card = card.parentElement;
+                    if (!card) break;
+                    const buttons = card.querySelectorAll("button");
+                    let hasShare = false;
+                    for (const btn of buttons) {{
+                        if (btn.textContent.toUpperCase().trim() === "SHARE") {{ hasShare = true; break; }}
+                    }}
+                    if (!hasShare) continue;
+                    // Premier texte significatif = titre
+                    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+                    let title = "";
+                    let node;
+                    while (node = walker.nextNode()) {{
+                        const t = node.textContent.trim();
+                        if (t.length > 2) {{ title = t; break; }}
+                    }}
+                    const titleLower = title.toLowerCase();
+                    // Vérifie que CHAQUE mot du keyword est présent dans le titre
+                    const allMatch = words.every(w => titleLower.includes(w));
+                    results.push({{ title, match: allMatch }});
+                    break;
+                }}
+            }}
+            return results;
+        }}
+    """)
+
+    print(f"[Pipeline] Cards found: {all_titles}")
+
+    # Cherche la première card qui matche tous les mots
+    match_result = await page.evaluate(f"""
+        () => {{
+            const words = {words_js};
+            const inputs = document.querySelectorAll(
+                "input[placeholder*='Discord'], input[placeholder*='discord'], " +
+                "input[placeholder*='Customer'], input[placeholder*='customer'], " +
+                "input[placeholder*='Username'], input[placeholder*='username']"
+            );
+            for (const input of inputs) {{
+                let card = input;
+                for (let i = 0; i < 10; i++) {{
+                    card = card.parentElement;
+                    if (!card) break;
+                    const buttons = card.querySelectorAll("button");
+                    let shareBtn = null;
+                    for (const btn of buttons) {{
+                        if (btn.textContent.toUpperCase().trim() === "SHARE") {{ shareBtn = btn; break; }}
+                    }}
+                    if (!shareBtn) continue;
+
+                    // Titre
+                    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+                    let title = "";
+                    let node;
+                    while (node = walker.nextNode()) {{
+                        const t = node.textContent.trim();
+                        if (t.length > 2) {{ title = t; break; }}
+                    }}
+
+                    // AND sur chaque mot
+                    const titleLower = title.toLowerCase();
+                    const allMatch = words.every(w => titleLower.includes(w));
+                    if (!allMatch) break;
+
+                    // Marque
+                    input.setAttribute("data-pipe-input", "true");
+                    shareBtn.setAttribute("data-pipe-btn", "true");
+                    return {{ status: "found", title }};
+                }}
+            }}
+            return {{ status: "not_found", cards: {words_js} }};
+        }}
+    """)
+
+    print(f"[Pipeline] Match result: {match_result}")
+    return match_result, [r["title"] for r in all_titles]
+
+
 async def winsight_grant_pipeline(discord_id: str, pipeline_site_name: str) -> tuple[bool, str]:
-    """
-    Ajoute discord_id à la pipeline dont le titre contient pipeline_site_name.
-    Même page que les weights (WINSIGHT_URL).
-    """
     print(f"[Pipeline Grant] discord_id={discord_id}, pipeline='{pipeline_site_name}'")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             await _winsight_login(page)
-
-            keyword = pipeline_site_name.lower().replace(" ", "").replace("-", "").replace("_", "")
-
-            # Debug : lister tous les titres de cards avec input+SHARE
-            all_titles = await page.evaluate("""
-                () => {
-                    const inputs = document.querySelectorAll(
-                        "input[placeholder*='Discord'], input[placeholder*='discord'], " +
-                        "input[placeholder*='Customer'], input[placeholder*='customer'], " +
-                        "input[placeholder*='Username'], input[placeholder*='username']"
-                    );
-                    const titles = [];
-                    for (const input of inputs) {
-                        let card = input;
-                        for (let i = 0; i < 10; i++) {
-                            card = card.parentElement;
-                            if (!card) break;
-                            const buttons = card.querySelectorAll("button");
-                            let hasShare = false;
-                            for (const btn of buttons) {
-                                if (btn.textContent.toUpperCase().trim() === "SHARE") { hasShare = true; break; }
-                            }
-                            if (!hasShare) continue;
-                            // Cherche le titre : premier texte significatif dans la card
-                            const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-                            let node;
-                            while (node = walker.nextNode()) {
-                                const t = node.textContent.trim();
-                                if (t.length > 2) { titles.push(t); break; }
-                            }
-                            break;
-                        }
-                    }
-                    return titles;
-                }
-            """)
-            print(f"[Pipeline Grant] Visible card titles: {all_titles}")
-
-            result = await page.evaluate(f"""
-                () => {{
-                    const keyword = "{keyword}";
-
-                    const inputs = document.querySelectorAll(
-                        "input[placeholder*='Discord'], input[placeholder*='discord'], " +
-                        "input[placeholder*='Customer'], input[placeholder*='customer'], " +
-                        "input[placeholder*='Username'], input[placeholder*='username']"
-                    );
-
-                    for (const input of inputs) {{
-                        let card = input;
-                        for (let i = 0; i < 10; i++) {{
-                            card = card.parentElement;
-                            if (!card) break;
-
-                            // Vérifie qu'il y a un bouton SHARE dans cette card
-                            const buttons = card.querySelectorAll("button");
-                            let shareBtn = null;
-                            for (const btn of buttons) {{
-                                if (btn.textContent.toUpperCase().trim() === "SHARE") {{
-                                    shareBtn = btn; break;
-                                }}
-                            }}
-                            if (!shareBtn) continue;
-
-                            // Cherche le keyword dans tout le texte de la card
-                            const cardText = card.textContent.toLowerCase().replace(/[\\s_\\-]/g, "");
-                            if (!cardText.includes(keyword)) continue;
-
-                            // Trouver le titre (premier texte significatif)
-                            const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-                            let titleText = "";
-                            let node;
-                            while (node = walker.nextNode()) {{
-                                const t = node.textContent.trim();
-                                if (t.length > 2) {{ titleText = t; break; }}
-                            }}
-
-                            input.setAttribute("data-pipe-input", "true");
-                            shareBtn.setAttribute("data-pipe-btn", "true");
-                            return {{ status: "found", title: titleText }};
-                        }}
-                    }}
-                    return {{ status: "not_found" }};
-                }}
-            """)
-
-            print(f"[Pipeline Grant] Search result: {result}")
-
+            result, all_titles = await _pipeline_find_card(page, pipeline_site_name)
             if result["status"] != "found":
                 await browser.close()
                 return False, f"❌ Pipeline `{pipeline_site_name}` introuvable. Titres visibles: {all_titles}"
-
             input_locator = page.locator("[data-pipe-input='true']")
             await input_locator.click()
             await input_locator.fill("")
             await input_locator.type(discord_id, delay=30)
             await asyncio.sleep(0.5)
-
             share_btn = page.locator("[data-pipe-btn='true']")
             await share_btn.click()
-            print(f"[Pipeline Grant] SHARE clicked for '{result['title']}'")
-
             await asyncio.sleep(2)
             await browser.close()
-            return True, f"✅ `{discord_id}` ajouté à la pipeline **{result['title']}**."
-
+            return True, f"✅ `{discord_id}` ajouté à **{result['title']}**."
     except Exception as e:
-        print(f"[Pipeline Grant] EXCEPTION: {e}")
         return False, f"Error: {str(e)}"
 
 
 async def winsight_revoke_pipeline(discord_id: str, pipeline_site_name: str) -> tuple[bool, str]:
-    """
-    Retire discord_id de la pipeline dont le titre contient pipeline_site_name.
-    """
     print(f"[Pipeline Revoke] discord_id={discord_id}, pipeline='{pipeline_site_name}'")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             await _winsight_login(page)
-
-            keyword = pipeline_site_name.lower().replace(" ", "").replace("-", "").replace("_", "")
-
-            result = await page.evaluate(f"""
+            result, all_titles = await _pipeline_find_card(page, pipeline_site_name)
+            if result["status"] != "found":
+                await browser.close()
+                return False, f"❌ Pipeline `{pipeline_site_name}` introuvable. Titres: {all_titles}"
+            title = result["title"]
+            import json as _json
+            words_js = _json.dumps([w.lower() for w in pipeline_site_name.strip().split() if w])
+            revoke_result = await page.evaluate(f"""
                 () => {{
-                    const keyword = "{keyword}";
+                    const words = {words_js};
                     const discordId = "{discord_id}";
-
                     const inputs = document.querySelectorAll(
                         "input[placeholder*='Discord'], input[placeholder*='discord'], " +
                         "input[placeholder*='Customer'], input[placeholder*='customer'], " +
                         "input[placeholder*='Username'], input[placeholder*='username']"
                     );
-
                     for (const input of inputs) {{
                         let card = input;
                         for (let i = 0; i < 10; i++) {{
                             card = card.parentElement;
                             if (!card) break;
-
                             const buttons = card.querySelectorAll("button");
                             let hasShare = false;
                             for (const btn of buttons) {{
                                 if (btn.textContent.toUpperCase().trim() === "SHARE") {{ hasShare = true; break; }}
                             }}
                             if (!hasShare) continue;
-
-                            const cardText = card.textContent.toLowerCase().replace(/[\\s_\\-]/g, "");
-                            if (!cardText.includes(keyword)) continue;
-
-                            // Titre
                             const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-                            let titleText = "";
+                            let cardTitle = "";
                             let node;
                             while (node = walker.nextNode()) {{
                                 const t = node.textContent.trim();
-                                if (t.length > 2) {{ titleText = t; break; }}
+                                if (t.length > 2) {{ cardTitle = t; break; }}
                             }}
-
-                            // Cherche le chip contenant l'ID Discord
+                            if (!words.every(w => cardTitle.toLowerCase().includes(w))) break;
                             if (!card.textContent.includes(discordId)) {{
-                                return {{ status: "user_not_found", title: titleText }};
+                                return {{ status: "user_not_found", title: cardTitle }};
                             }}
-
-                            // Cherche le bouton × près du chip
                             const allEls = card.querySelectorAll("*");
                             for (const el of allEls) {{
-                                if (el.textContent.includes(discordId)) {{
-                                    const parent = el.closest
-                                        ? el.closest("[class*='chip'],[class*='badge'],[class*='tag'],[class*='share']")
-                                        : null;
-                                    const container = parent || el.parentElement;
-                                    if (!container) continue;
-                                    // Bouton × ou svg clickable
-                                    const closeEl = container.querySelector("button, [role='button'], svg, [class*='close'],[class*='remove'],[class*='delete']");
-                                    if (closeEl) {{
-                                        closeEl.setAttribute("data-pipe-revoke", "true");
-                                        return {{ status: "found", title: titleText }};
+                                if (el.children.length > 0) continue;
+                                if (!el.textContent.includes(discordId)) continue;
+                                let chip = el;
+                                for (let j = 0; j < 4; j++) {{
+                                    chip = chip.parentElement;
+                                    if (!chip) break;
+                                    const close = chip.querySelector("button, [role='button'], svg");
+                                    if (close) {{
+                                        close.setAttribute("data-pipe-revoke", "true");
+                                        return {{ status: "found", title: cardTitle }};
                                     }}
-                                    // Fallback: click sur le parent direct
-                                    container.setAttribute("data-pipe-revoke", "true");
-                                    return {{ status: "found", title: titleText }};
                                 }}
                             }}
-                            return {{ status: "revoke_btn_not_found", title: titleText }};
+                            return {{ status: "revoke_btn_not_found", title: cardTitle }};
                         }}
                     }}
                     return {{ status: "pipeline_not_found" }};
                 }}
             """)
-
-            print(f"[Pipeline Revoke] Search result: {result}")
-
-            if result["status"] == "pipeline_not_found":
+            print(f"[Pipeline Revoke] result: {revoke_result}")
+            if revoke_result["status"] == "user_not_found":
                 await browser.close()
-                return False, f"❌ Pipeline `{pipeline_site_name}` introuvable."
-            if result["status"] == "user_not_found":
+                return False, f"❌ `{discord_id}` n'a pas accès à **{title}**."
+            if revoke_result["status"] == "revoke_btn_not_found":
                 await browser.close()
-                return False, f"❌ `{discord_id}` n'a pas accès à **{result['title']}**."
-            if result["status"] == "revoke_btn_not_found":
+                return False, f"❌ Bouton × introuvable pour `{discord_id}` dans **{title}**."
+            if revoke_result["status"] != "found":
                 await browser.close()
-                return False, f"❌ Bouton de révocation introuvable pour `{discord_id}` dans **{result['title']}**."
-
+                return False, f"❌ Erreur: {revoke_result['status']}."
             revoke_btn = page.locator("[data-pipe-revoke='true']").first
             await revoke_btn.click(timeout=5000)
-            print(f"[Pipeline Revoke] Revoke clicked for '{result['title']}'")
-
             await asyncio.sleep(2)
             await browser.close()
-            return True, f"✅ `{discord_id}` retiré de **{result['title']}**."
-
+            return True, f"✅ `{discord_id}` retiré de **{title}**."
     except Exception as e:
-        print(f"[Pipeline Revoke] EXCEPTION: {e}")
         return False, f"Error: {str(e)}"
 
 
