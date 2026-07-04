@@ -1312,10 +1312,16 @@ async def winsight_grant_pipeline(discord_id: str, pipeline_site_name: str) -> t
                             }} else {{
                                 const children = card.querySelectorAll("span,div,p,strong,b");
                                 for (const el of children) {{
-                                    const tag = el.tagName.toUpperCase();
-                                    if (tag === "BUTTON" || tag === "INPUT") continue;
+                                    let insideBtn = false;
+                                    let p = el;
+                                    while (p && p !== card) {{
+                                        const ptag = p.tagName ? p.tagName.toUpperCase() : "";
+                                        if (ptag === "BUTTON" || ptag === "INPUT") {{ insideBtn = true; break; }}
+                                        p = p.parentElement;
+                                    }}
+                                    if (insideBtn) continue;
                                     const t = el.textContent.trim();
-                                    if (t.length > 2 && t.length < 100) {{ title = t; break; }}
+                                    if (t.length > 2 && t.length < 100 && t.toUpperCase() !== "SHARE") {{ title = t; break; }}
                                 }}
                             }}
                             results.push(title);
@@ -1353,10 +1359,16 @@ async def winsight_grant_pipeline(discord_id: str, pipeline_site_name: str) -> t
                             }} else {{
                                 const children = card.querySelectorAll("span,div,p,strong,b");
                                 for (const el of children) {{
-                                    const tag = el.tagName.toUpperCase();
-                                    if (tag === "BUTTON" || tag === "INPUT") continue;
+                                    let insideBtn = false;
+                                    let p = el;
+                                    while (p && p !== card) {{
+                                        const ptag = p.tagName ? p.tagName.toUpperCase() : "";
+                                        if (ptag === "BUTTON" || ptag === "INPUT") {{ insideBtn = true; break; }}
+                                        p = p.parentElement;
+                                    }}
+                                    if (insideBtn) continue;
                                     const t = el.textContent.trim();
-                                    if (t.length > 2 && t.length < 100) {{ title = t; break; }}
+                                    if (t.length > 2 && t.length < 100 && t.toUpperCase() !== "SHARE") {{ title = t; break; }}
                                 }}
                             }}
                             if (!words.every(w => title.toLowerCase().includes(w))) break;
@@ -1427,10 +1439,16 @@ async def winsight_revoke_pipeline(discord_id: str, pipeline_site_name: str) -> 
                             }} else {{
                                 const children = card.querySelectorAll("span,div,p,strong,b");
                                 for (const el of children) {{
-                                    const tag = el.tagName.toUpperCase();
-                                    if (tag === "BUTTON" || tag === "INPUT") continue;
+                                    let insideBtn = false;
+                                    let p = el;
+                                    while (p && p !== card) {{
+                                        const ptag = p.tagName ? p.tagName.toUpperCase() : "";
+                                        if (ptag === "BUTTON" || ptag === "INPUT") {{ insideBtn = true; break; }}
+                                        p = p.parentElement;
+                                    }}
+                                    if (insideBtn) continue;
                                     const t = el.textContent.trim();
-                                    if (t.length > 2 && t.length < 100) {{ title = t; break; }}
+                                    if (t.length > 2 && t.length < 100 && t.toUpperCase() !== "SHARE") {{ title = t; break; }}
                                 }}
                             }}
                             results.push({{ title, hasDiscordId: card.textContent.includes("{discord_id}") }});
@@ -1469,28 +1487,66 @@ async def winsight_revoke_pipeline(discord_id: str, pipeline_site_name: str) -> 
                             }} else {{
                                 const children = card.querySelectorAll("span,div,p,strong,b");
                                 for (const el of children) {{
-                                    const tag = el.tagName.toUpperCase();
-                                    if (tag === "BUTTON" || tag === "INPUT") continue;
+                                    let insideBtn = false;
+                                    let p = el;
+                                    while (p && p !== card) {{
+                                        const ptag = p.tagName ? p.tagName.toUpperCase() : "";
+                                        if (ptag === "BUTTON" || ptag === "INPUT") {{ insideBtn = true; break; }}
+                                        p = p.parentElement;
+                                    }}
+                                    if (insideBtn) continue;
                                     const t = el.textContent.trim();
-                                    if (t.length > 2 && t.length < 100) {{ title = t; break; }}
+                                    if (t.length > 2 && t.length < 100 && t.toUpperCase() !== "SHARE") {{ title = t; break; }}
                                 }}
                             }}
                             if (!words.every(w => title.toLowerCase().includes(w))) break;
                             if (!card.textContent.includes(discordId)) {{
                                 return {{ status: "user_not_found", title }};
                             }}
+
+                            function findCloseChar(root) {{
+                                const all = root.querySelectorAll("*");
+                                for (const el of all) {{
+                                    if (el.children.length > 0) continue;
+                                    const t = el.textContent.trim();
+                                    if (t === "×" || t === "x" || t === "X" || t === "✕" || t === "✖") return el;
+                                }}
+                                return null;
+                            }}
+
                             const allEls = card.querySelectorAll("*");
                             for (const el of allEls) {{
                                 if (el.children.length > 0) continue;
                                 if (!el.textContent.includes(discordId)) continue;
+
+                                // Cas 1 : × dans un élément proche
+                                let container = el;
+                                for (let depth = 0; depth < 6; depth++) {{
+                                    if (!container) break;
+                                    const closeEl = findCloseChar(container);
+                                    if (closeEl && closeEl !== el) {{
+                                        closeEl.setAttribute("data-pipe-revoke", "true");
+                                        return {{ status: "found", title, mode: "char" }};
+                                    }}
+                                    container = container.parentElement;
+                                }}
+
+                                // Cas 2 : × dans le même texte que l'ID (chip combiné "id ×")
+                                const ownText = el.textContent.trim();
+                                if (ownText.includes("×") || ownText.includes("✕") || ownText.includes("✖")) {{
+                                    el.setAttribute("data-pipe-revoke", "true");
+                                    return {{ status: "found", title, mode: "self" }};
+                                }}
+
+                                // Cas 3 : bouton/svg en dernier recours
                                 let chip = el;
-                                for (let j = 0; j < 4; j++) {{
+                                for (let j = 0; j < 5; j++) {{
                                     chip = chip.parentElement;
                                     if (!chip) break;
                                     const close = chip.querySelector("button, [role='button'], svg");
                                     if (close) {{
                                         close.setAttribute("data-pipe-revoke", "true");
-                                        return {{ status: "found", title }};
+                                        return {{ status: "found", title, mode: "btn" }};
                                     }}
                                 }}
                             }}
@@ -1517,7 +1573,14 @@ async def winsight_revoke_pipeline(discord_id: str, pipeline_site_name: str) -> 
                 return False, f"❌ Pipeline `{pipeline_site_name}` introuvable."
 
             revoke_btn = page.locator("[data-pipe-revoke='true']").first
-            await revoke_btn.click(timeout=5000)
+            if revoke_result.get("mode") == "self":
+                box = await revoke_btn.bounding_box()
+                if box:
+                    await page.mouse.click(box["x"] + box["width"] - 5, box["y"] + box["height"] / 2)
+                else:
+                    await revoke_btn.click(timeout=5000)
+            else:
+                await revoke_btn.click(timeout=5000)
             await asyncio.sleep(2)
             await browser.close()
             return True, f"✅ `{discord_id}` retiré de **{revoke_result['title']}**."
@@ -1730,8 +1793,8 @@ async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
 async def _winsight_revoke_one(page, discord_id: str, model_name: str) -> tuple[bool, str]:
     """
     Retire discord_id de la card correspondant à model_name.
-    Trouve la card (comme _winsight_grant_one), puis cherche le chip contenant
-    discord_id à l'intérieur et clique son bouton de suppression (x / bin icon).
+    Le chip est du type "7200658... ×" où × est un simple caractère texte
+    dans un élément séparé (pas un bouton/svg imbriqué).
     """
     result = await page.evaluate(f"""
         () => {{
@@ -1752,7 +1815,6 @@ async def _winsight_revoke_one(page, discord_id: str, model_name: str) -> tuple[
             }}
             if (!matchEl) return {{ status: "not_found" }};
 
-            // Remonte jusqu'à la card contenant l'input + bouton SHARE
             let card = matchEl;
             for (let i = 0; i < 12; i++) {{
                 card = card.parentElement;
@@ -1771,11 +1833,44 @@ async def _winsight_revoke_one(page, discord_id: str, model_name: str) -> tuple[
                 return {{ status: "user_not_found" }};
             }}
 
-            // Cherche l'élément feuille contenant l'ID Discord, remonte pour trouver un bouton/svg cliquable
+            function findCloseChar(root) {{
+                const all = root.querySelectorAll("*");
+                for (const el of all) {{
+                    if (el.children.length > 0) continue;
+                    const t = el.textContent.trim();
+                    if (t === "×" || t === "x" || t === "X" || t === "✕" || t === "✖") return el;
+                }}
+                return null;
+            }}
+
+            // Trouve la feuille contenant l'ID Discord (peut être le chip complet "id ×")
             const allEls = card.querySelectorAll("*");
             for (const el of allEls) {{
-                if (el.children.length > 0) continue;  // feuilles seulement
+                if (el.children.length > 0) continue;
                 if (!el.textContent.includes(discordId)) continue;
+
+                // Cas 1 : le × est un caractère texte DANS le même élément (ex: "12345 ×")
+                // On simule un clic sur l'élément lui-même — souvent le chip entier est cliquable
+                // mais on cherche d'abord un frère ou enfant dédié au ×
+                let container = el;
+                for (let depth = 0; depth < 6; depth++) {{
+                    if (!container) break;
+                    const closeEl = findCloseChar(container);
+                    if (closeEl && closeEl !== el) {{
+                        closeEl.setAttribute("data-bot-revoke-btn", "true");
+                        return {{ status: "found", mode: "char" }};
+                    }}
+                    container = container.parentElement;
+                }}
+
+                // Cas 2 : le × fait partie du texte de l'élément lui-même (ex: "12345 ×" en un seul noeud)
+                const ownText = el.textContent.trim();
+                if (ownText.includes("×") || ownText.includes("✕") || ownText.includes("✖")) {{
+                    el.setAttribute("data-bot-revoke-btn", "true");
+                    return {{ status: "found", mode: "self" }};
+                }}
+
+                // Cas 3 : cherche un bouton/svg proche en dernier recours
                 let chip = el;
                 for (let j = 0; j < 5; j++) {{
                     chip = chip.parentElement;
@@ -1783,7 +1878,7 @@ async def _winsight_revoke_one(page, discord_id: str, model_name: str) -> tuple[
                     const close = chip.querySelector("button, [role='button'], svg");
                     if (close) {{
                         close.setAttribute("data-bot-revoke-btn", "true");
-                        return {{ status: "found" }};
+                        return {{ status: "found", mode: "btn" }};
                     }}
                 }}
             }}
@@ -1793,7 +1888,15 @@ async def _winsight_revoke_one(page, discord_id: str, model_name: str) -> tuple[
 
     if result["status"] == "found":
         btn = page.locator("[data-bot-revoke-btn='true']").first
-        await btn.click(timeout=5000)
+        if result.get("mode") == "self":
+            # Clique précisément sur la position du × dans l'élément (coin droit)
+            box = await btn.bounding_box()
+            if box:
+                await page.mouse.click(box["x"] + box["width"] - 5, box["y"] + box["height"] / 2)
+            else:
+                await btn.click(timeout=5000)
+        else:
+            await btn.click(timeout=5000)
         await asyncio.sleep(1.5)
         return True, f"✓ {model_name}"
     elif result["status"] == "not_found":
