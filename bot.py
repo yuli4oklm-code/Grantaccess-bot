@@ -1418,17 +1418,40 @@ async def winsight_grant_all(discord_id: str, model_names: list[str]) -> tuple[i
 
 async def _pipeline_find_card(page, pipeline_site_name: str) -> dict:
     """
-    Cherche la card de pipeline dont le titre correspond le mieux à pipeline_site_name.
-    Stratégie : cherche chaque mot du keyword séparément dans le titre (AND),
-    ce qui évite que "apex cubis" matche "Drakoniz Apex".
+    Cherche la card de pipeline dont le titre correspond à pipeline_site_name.
+    Stratégie : AND sur chaque mot du keyword dans le titre de la card.
+    Le titre est le premier texte significatif hors boutons/inputs.
     """
-    # Mots-clés : on split par espace pour faire un AND sur chaque mot
     words = [w.lower() for w in pipeline_site_name.strip().split() if w]
     words_js = json.dumps(words)
 
     all_titles = await page.evaluate(f"""
         () => {{
             const words = {words_js};
+
+            function getCardTitle(card) {{
+                // Parcourt les noeuds texte en excluant boutons et inputs
+                const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT, {{
+                    acceptNode: (node) => {{
+                        let p = node.parentElement;
+                        while (p && p !== card) {{
+                            const tag = p.tagName ? p.tagName.toUpperCase() : "";
+                            if (tag === "BUTTON" || tag === "INPUT" || tag === "TEXTAREA") {{
+                                return NodeFilter.FILTER_REJECT;
+                            }}
+                            p = p.parentElement;
+                        }}
+                        return NodeFilter.FILTER_ACCEPT;
+                    }}
+                }});
+                let node;
+                while (node = walker.nextNode()) {{
+                    const t = node.textContent.trim();
+                    if (t.length > 2) return t;
+                }}
+                return "";
+            }}
+
             const inputs = document.querySelectorAll(
                 "input[placeholder*='Discord'], input[placeholder*='discord'], " +
                 "input[placeholder*='Customer'], input[placeholder*='customer'], " +
@@ -1446,17 +1469,8 @@ async def _pipeline_find_card(page, pipeline_site_name: str) -> dict:
                         if (btn.textContent.toUpperCase().trim() === "SHARE") {{ hasShare = true; break; }}
                     }}
                     if (!hasShare) continue;
-                    // Premier texte significatif = titre
-                    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-                    let title = "";
-                    let node;
-                    while (node = walker.nextNode()) {{
-                        const t = node.textContent.trim();
-                        if (t.length > 2) {{ title = t; break; }}
-                    }}
-                    const titleLower = title.toLowerCase();
-                    // Vérifie que CHAQUE mot du keyword est présent dans le titre
-                    const allMatch = words.every(w => titleLower.includes(w));
+                    const title = getCardTitle(card);
+                    const allMatch = words.every(w => title.toLowerCase().includes(w));
                     results.push({{ title, match: allMatch }});
                     break;
                 }}
@@ -1467,10 +1481,32 @@ async def _pipeline_find_card(page, pipeline_site_name: str) -> dict:
 
     print(f"[Pipeline] Cards found: {all_titles}")
 
-    # Cherche la première card qui matche tous les mots
     match_result = await page.evaluate(f"""
         () => {{
             const words = {words_js};
+
+            function getCardTitle(card) {{
+                const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT, {{
+                    acceptNode: (node) => {{
+                        let p = node.parentElement;
+                        while (p && p !== card) {{
+                            const tag = p.tagName ? p.tagName.toUpperCase() : "";
+                            if (tag === "BUTTON" || tag === "INPUT" || tag === "TEXTAREA") {{
+                                return NodeFilter.FILTER_REJECT;
+                            }}
+                            p = p.parentElement;
+                        }}
+                        return NodeFilter.FILTER_ACCEPT;
+                    }}
+                }});
+                let node;
+                while (node = walker.nextNode()) {{
+                    const t = node.textContent.trim();
+                    if (t.length > 2) return t;
+                }}
+                return "";
+            }}
+
             const inputs = document.querySelectorAll(
                 "input[placeholder*='Discord'], input[placeholder*='discord'], " +
                 "input[placeholder*='Customer'], input[placeholder*='customer'], " +
@@ -1487,28 +1523,14 @@ async def _pipeline_find_card(page, pipeline_site_name: str) -> dict:
                         if (btn.textContent.toUpperCase().trim() === "SHARE") {{ shareBtn = btn; break; }}
                     }}
                     if (!shareBtn) continue;
-
-                    // Titre
-                    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-                    let title = "";
-                    let node;
-                    while (node = walker.nextNode()) {{
-                        const t = node.textContent.trim();
-                        if (t.length > 2) {{ title = t; break; }}
-                    }}
-
-                    // AND sur chaque mot
-                    const titleLower = title.toLowerCase();
-                    const allMatch = words.every(w => titleLower.includes(w));
-                    if (!allMatch) break;
-
-                    // Marque
+                    const title = getCardTitle(card);
+                    if (!words.every(w => title.toLowerCase().includes(w))) break;
                     input.setAttribute("data-pipe-input", "true");
                     shareBtn.setAttribute("data-pipe-btn", "true");
                     return {{ status: "found", title }};
                 }}
             }}
-            return {{ status: "not_found", cards: {words_js} }};
+            return {{ status: "not_found" }};
         }}
     """)
 
