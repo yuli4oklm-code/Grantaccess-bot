@@ -1,8 +1,6 @@
 """
 Bot Discord séparé : commande Stripe + livraison automatique sur Winsight via Playwright.
-
-Ce bot NE TOUCHE PAS au bot principal (tickets/templates/giveaways/etc).
-C'est un projet complètement indépendant, avec son propre token Discord et son propre déploiement Railway.
++ /weight system avec specs, tickets, et order flow
 """
 
 import discord
@@ -13,6 +11,7 @@ import os
 import json
 import threading
 import time
+import re
 
 import stripe
 from flask import Flask, request, jsonify
@@ -40,21 +39,48 @@ ENGINEX_ENTITLEMENTS_URL = os.environ.get("ENGINEX_ENTITLEMENTS_URL", "https://e
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
 ORDER_PANEL_CHANNEL_ID = int(os.environ.get("ORDER_PANEL_CHANNEL_ID", "0")) or None
 VOUCH_CHANNEL_ID = int(os.environ.get("VOUCH_CHANNEL_ID", "0")) or None
+TICKET_CATEGORY_ID = int(os.environ.get("TICKET_CATEGORY_ID", "1513173071916302499")) or None
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 ORDERS_FILE = os.path.join(DATA_DIR, "winsight_orders.json")
 PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
+WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
 
 EMBED_COLOR = 0x2F3136
 CONFIG_BACKUP_MARKER = "WINSIGHT_BOT_CONFIG_BACKUP_V1"
 
-# Produits disponibles : nom du modèle -> {"winsight": prix_centimes, "enginex": prix_centimes}
 DEFAULT_PRODUCTS = {
     "XyCubValorantV2": {"winsight": 2000},
 }
 DEFAULT_PIPELINES = {}
+
+# ─────────────────────────────────────────────
+#  MAPPING NOM MODELE → DISPLAY NAME
+# ─────────────────────────────────────────────
+
+def get_display_name(model_name: str) -> str:
+    """
+    Transforme XyCubValorantV2 → Valorant V2, XyCubValorantV3 → Valorant V3, etc.
+    Règle : on retire les préfixes connus (XyCub, Moon, etc.) et on garde le reste lisible.
+    """
+    name = model_name
+
+    # Retirer les préfixes connus
+    prefixes = ["XyCub", "xycub", "Moon", "moon", "MOON"]
+    for prefix in prefixes:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+
+    # CamelCase → mots séparés : "ValorantV2" → "Valorant V2"
+    # Insère un espace avant chaque majuscule qui suit une minuscule, ou avant "V" suivi d'un chiffre
+    name = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
+    name = re.sub(r'(?<=[a-zA-Z])(V\d+)', r' \1', name)
+
+    return name.strip()
+
 
 # ─────────────────────────────────────────────
 #  STOCKAGE
@@ -101,7 +127,15 @@ def save_pipelines(data):
     save_json(PIPELINES_FILE, data)
 
 
-def create_order(order_id: str, buyer_id: int, buyer_contact: str, model: str, platform: str, stripe_session_id: str):
+def load_weights():
+    return load_json(WEIGHTS_FILE, {})
+
+
+def save_weights(data):
+    save_json(WEIGHTS_FILE, data)
+
+
+def create_order(order_id, buyer_id, buyer_contact, model, platform, stripe_session_id):
     data = load_orders()
     data[order_id] = {
         "buyer_id": buyer_id,
@@ -116,11 +150,11 @@ def create_order(order_id: str, buyer_id: int, buyer_contact: str, model: str, p
     save_orders(data)
 
 
-def get_order(order_id: str):
+def get_order(order_id):
     return load_orders().get(order_id)
 
 
-def get_order_by_session(session_id: str):
+def get_order_by_session(session_id):
     data = load_orders()
     for oid, o in data.items():
         if o.get("stripe_session_id") == session_id:
@@ -128,7 +162,7 @@ def get_order_by_session(session_id: str):
     return None, None
 
 
-def update_order(order_id: str, **kwargs):
+def update_order(order_id, **kwargs):
     data = load_orders()
     if order_id in data:
         data[order_id].update(kwargs)
@@ -176,11 +210,9 @@ main_loop = None
 async def get_config_backup_channel():
     if not STAFF_CHANNEL_ID:
         return None
-
     channel = bot.get_channel(STAFF_CHANNEL_ID)
     if channel:
         return channel
-
     try:
         return await bot.fetch_channel(STAFF_CHANNEL_ID)
     except Exception as e:
@@ -192,23 +224,20 @@ async def find_config_backup_message():
     channel = await get_config_backup_channel()
     if not channel:
         return None
-
     try:
         async for message in channel.history(limit=100):
             if message.author == bot.user and CONFIG_BACKUP_MARKER in message.content:
                 return message
     except Exception as e:
         print(f"[Config Backup] Could not read channel history: {e}")
-
     return None
 
 
-def parse_config_backup(content: str):
+def parse_config_backup(content):
     start = content.find("{")
     end = content.rfind("}") + 1
     if start < 0 or end <= start:
         return None
-
     try:
         return json.loads(content[start:end])
     except json.JSONDecodeError as e:
@@ -221,26 +250,22 @@ async def restore_config_from_discord():
     if not message:
         print("[Config Backup] No Discord backup found.")
         return False
-
     payload = parse_config_backup(message.content)
     if not payload:
         return False
-
     if "products" in payload:
         save_json(PRODUCTS_FILE, payload["products"])
     if "pipelines" in payload:
         save_pipelines(payload["pipelines"])
-
     print("[Config Backup] Restored products/pipelines from Discord backup.")
     return True
 
 
-async def backup_config_to_discord(reason: str = "manual update"):
+async def backup_config_to_discord(reason="manual update"):
     channel = await get_config_backup_channel()
     if not channel:
         print("[Config Backup] STAFF_CHANNEL_ID is not configured; backup skipped.")
         return
-
     payload = {
         "version": 1,
         "updated_at": int(time.time()),
@@ -249,11 +274,9 @@ async def backup_config_to_discord(reason: str = "manual update"):
         "pipelines": load_pipelines(),
     }
     content = f"{CONFIG_BACKUP_MARKER}\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
-
     if len(content) > 2000:
         print("[Config Backup] Backup is too large for one Discord message; backup skipped.")
         return
-
     try:
         message = await find_config_backup_message()
         if message:
@@ -273,13 +296,550 @@ ORDER_EMBED_DESCRIPTION = (
 )
 
 
+# ─────────────────────────────────────────────
+#  WEIGHT SYSTEM
+# ─────────────────────────────────────────────
+
+def build_weight_embed(weight_data: dict) -> discord.Embed:
+    """Construit l'embed d'affichage d'un weight (style screenshot)."""
+    name = weight_data.get("name", "Unknown")
+    description = weight_data.get("description", "")
+    game = weight_data.get("game", "")
+    price_display = weight_data.get("price_display", "")
+    platforms = weight_data.get("platforms", [])
+    version = weight_data.get("version", "")
+    author = weight_data.get("author", "")
+    image_url = weight_data.get("image_url", "")
+
+    # Plateformes avec couleurs style "AE • WIN • EX"
+    platform_str = " • ".join(p.upper() for p in platforms) if platforms else ""
+
+    embed = discord.Embed(color=0x5865F2)
+    embed.title = f"**{name}**"
+
+    lines = []
+    if description:
+        lines.append(description)
+    lines.append("")
+
+    if game:
+        lines.append(f"🎮 **Game**\n{game}")
+
+    if platform_str:
+        lines.append(f"🖥️ **Platforms**\n{platform_str}")
+
+    if price_display:
+        lines.append(f"💰 **Price**\n{price_display}")
+
+    lines.append("📦 **Includes**\n• All current and future versions")
+
+    embed.description = "\n\n".join(lines)
+
+    if version or author:
+        footer_parts = []
+        if version:
+            footer_parts.append(version)
+        if author:
+            footer_parts.append(f"by @{author}")
+        embed.set_footer(text=" • ".join(footer_parts))
+
+    if image_url:
+        embed.set_image(url=image_url)
+
+    return embed
+
+
+def build_specs_embed(weight_data: dict) -> discord.Embed:
+    """Construit l'embed specs (style screenshot avec sections General/AE/WIN)."""
+    name = weight_data.get("name", "Unknown")
+    specs_general = weight_data.get("specs_general", "")
+    specs_ae = weight_data.get("specs_ae", "")
+    specs_win = weight_data.get("specs_win", "")
+    specs_ex = weight_data.get("specs_ex", "")
+    version = weight_data.get("version", "")
+    author = weight_data.get("author", "")
+
+    embed = discord.Embed(
+        title=f"🗂️ {name} — Specs",
+        color=0x2F3136,
+    )
+
+    if specs_general:
+        embed.add_field(name="🌐 General", value=specs_general, inline=False)
+    if specs_ae:
+        embed.add_field(name="AE", value=specs_ae, inline=False)
+    if specs_win:
+        embed.add_field(name="WIN", value=specs_win, inline=False)
+    if specs_ex:
+        embed.add_field(name="EX", value=specs_ex, inline=False)
+
+    if version or author:
+        footer_parts = []
+        if version:
+            footer_parts.append(version)
+        if author:
+            footer_parts.append(f"by @{author}")
+        embed.set_footer(text=" • ".join(footer_parts))
+
+    return embed
+
+
+class WeightView(discord.ui.View):
+    """View persistante avec les boutons Specs, Purchase Ticket, Order Weight."""
+
+    def __init__(self, weight_id: str):
+        super().__init__(timeout=None)
+        self.weight_id = weight_id
+        # On encode le weight_id dans le custom_id pour persistance
+        self.children[0].custom_id = f"weight_specs_{weight_id}"
+        self.children[1].custom_id = f"weight_ticket_{weight_id}"
+        self.children[2].custom_id = f"weight_order_{weight_id}"
+
+    @discord.ui.button(label="📋 Specs", style=discord.ButtonStyle.secondary, custom_id="weight_specs_placeholder")
+    async def specs_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        weight_id = button.custom_id.replace("weight_specs_", "")
+        weights = load_weights()
+        weight_data = weights.get(weight_id)
+        if not weight_data:
+            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+            return
+        embed = build_specs_embed(weight_data)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🎫 Purchase Ticket", style=discord.ButtonStyle.primary, custom_id="weight_ticket_placeholder")
+    async def ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        weight_id = button.custom_id.replace("weight_ticket_", "")
+        weights = load_weights()
+        weight_data = weights.get(weight_id)
+        if not weight_data:
+            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        category = None
+        if TICKET_CATEGORY_ID:
+            category = guild.get_channel(TICKET_CATEGORY_ID)
+
+        # Vérifier si l'utilisateur a déjà un ticket ouvert pour ce weight
+        ticket_name = f"ticket-{interaction.user.name.lower().replace(' ', '-')}"
+        existing = discord.utils.get(guild.text_channels, name=ticket_name)
+        if existing:
+            await interaction.response.send_message(
+                f"❌ You already have an open ticket: {existing.mention}", ephemeral=True
+            )
+            return
+
+        # Créer le salon ticket
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        }
+        # Donner accès aux admins
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=ticket_name,
+                category=category,
+                overwrites=overwrites,
+                topic=f"Purchase ticket for {weight_data['name']} | {interaction.user.id}",
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Could not create ticket: {e}", ephemeral=True)
+            return
+
+        # Embed dans le ticket
+        weight_name = weight_data.get("name", "Unknown")
+        price_display = weight_data.get("price_display", "")
+
+        ticket_embed = discord.Embed(
+            title=f"🎫 Purchase Ticket — {weight_name}",
+            description=(
+                f"Hello {interaction.user.mention}! 👋\n\n"
+                f"You've opened a ticket to purchase **{weight_name}**.\n"
+                f"{'**Price:** ' + price_display + chr(10) if price_display else ''}"
+                f"\nA staff member will assist you shortly.\n\n"
+                f"*You can also use the button below to order directly via Stripe.*"
+            ),
+            color=0x5865F2,
+        )
+        ticket_embed.set_footer(text=f"Ticket opened by {interaction.user} • {interaction.user.id}")
+
+        # Bouton de fermeture du ticket
+        close_view = TicketCloseView(interaction.user.id)
+        await ticket_channel.send(
+            content=f"{interaction.user.mention}",
+            embed=ticket_embed,
+            view=close_view,
+        )
+
+        # Ping staff si configuré
+        if STAFF_CHANNEL_ID:
+            staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
+            if staff_channel:
+                await staff_channel.send(
+                    f"📬 New purchase ticket for **{weight_name}** by {interaction.user.mention} → {ticket_channel.mention}"
+                )
+
+        await interaction.response.send_message(
+            f"✅ Your ticket has been created: {ticket_channel.mention}", ephemeral=True
+        )
+
+    @discord.ui.button(label="💳 Order Weight", style=discord.ButtonStyle.success, custom_id="weight_order_placeholder")
+    async def order_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        weight_id = button.custom_id.replace("weight_order_", "")
+        weights = load_weights()
+        weight_data = weights.get(weight_id)
+        if not weight_data:
+            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+            return
+
+        # Trouver le modèle correspondant dans les produits
+        model_name = weight_data.get("product_model", "")
+        products = load_products()
+
+        if not model_name or model_name not in products:
+            # Fallback: afficher le sélecteur général
+            select_view = discord.ui.View(timeout=120)
+            select_view.add_item(ModelSelect())
+            await interaction.response.send_message(
+                "Which model would you like to order?", view=select_view, ephemeral=True
+            )
+            return
+
+        available_platforms = products[model_name]
+        if len(available_platforms) == 1:
+            only_platform = next(iter(available_platforms))
+            await interaction.response.send_modal(ContactOnlyModal(model_name, only_platform))
+        else:
+            platform_view = discord.ui.View(timeout=120)
+            platform_view.add_item(PlatformSelect(model_name, available_platforms))
+            await interaction.response.send_message(
+                f"**{get_display_name(model_name)}** is available on multiple platforms. Which one?",
+                view=platform_view,
+                ephemeral=True,
+            )
+
+
+class TicketCloseView(discord.ui.View):
+    """View avec bouton de fermeture du ticket."""
+
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=None)
+        self.owner_id = owner_id
+
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="ticket_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Seul le staff (admin) ou l'owner peut fermer
+        is_admin = interaction.user.guild_permissions.administrator
+        is_owner = interaction.user.id == self.owner_id
+
+        if not is_admin and not is_owner:
+            await interaction.response.send_message("❌ You can't close this ticket.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("🔒 Closing ticket in 5 seconds...")
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except Exception as e:
+            print(f"[Ticket] Could not delete channel: {e}")
+
+
+# ─────────────────────────────────────────────
+#  WEIGHT MODAL
+# ─────────────────────────────────────────────
+
+class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
+    name_input = discord.ui.TextInput(
+        label="Weight name (ex: Rankzilla)",
+        max_length=100,
+        required=True,
+        placeholder="Rankzilla",
+    )
+    description_input = discord.ui.TextInput(
+        label="Description",
+        style=discord.TextStyle.paragraph,
+        max_length=300,
+        required=True,
+        placeholder="Pure ranked dataset, optimized for CDL maps...",
+    )
+    game_input = discord.ui.TextInput(
+        label="Game",
+        max_length=100,
+        required=False,
+        placeholder="Call of Duty: Black Ops 7",
+    )
+    price_input = discord.ui.TextInput(
+        label="Price display (ex: $30 USD or ~~$40~~ $30 USD)",
+        max_length=100,
+        required=False,
+        placeholder="$30 USD",
+    )
+    image_input = discord.ui.TextInput(
+        label="Image URL + platforms + version + author",
+        style=discord.TextStyle.paragraph,
+        max_length=800,
+        required=False,
+        placeholder="image: https://...\nplatforms: ae,win,ex\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
+    )
+
+    def __init__(self, weight_id: str = None, existing: dict = None):
+        super().__init__()
+        self.weight_id = weight_id
+        if existing:
+            self.name_input.default = existing.get("name", "")
+            self.description_input.default = existing.get("description", "")
+            self.game_input.default = existing.get("game", "")
+            self.price_input.default = existing.get("price_display", "")
+            # Reconstruire le champ image
+            parts = []
+            if existing.get("image_url"):
+                parts.append(f"image: {existing['image_url']}")
+            if existing.get("platforms"):
+                parts.append(f"platforms: {','.join(existing['platforms'])}")
+            if existing.get("version"):
+                parts.append(f"version: {existing['version']}")
+            if existing.get("author"):
+                parts.append(f"author: {existing['author']}")
+            if existing.get("product_model"):
+                parts.append(f"model: {existing['product_model']}")
+            self.image_input.default = "\n".join(parts)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Parser le champ multi-info
+        image_url = ""
+        platforms = []
+        version = ""
+        author = ""
+        product_model = ""
+
+        for line in self.image_input.value.strip().splitlines():
+            line = line.strip()
+            if line.lower().startswith("image:"):
+                image_url = line[6:].strip()
+            elif line.lower().startswith("platforms:"):
+                raw = line[10:].strip()
+                platforms = [p.strip().lower() for p in raw.split(",") if p.strip()]
+            elif line.lower().startswith("version:"):
+                version = line[8:].strip()
+            elif line.lower().startswith("author:"):
+                author = line[7:].strip()
+            elif line.lower().startswith("model:"):
+                product_model = line[6:].strip()
+
+        weight_data = {
+            "name": self.name_input.value.strip(),
+            "description": self.description_input.value.strip(),
+            "game": self.game_input.value.strip(),
+            "price_display": self.price_input.value.strip(),
+            "image_url": image_url,
+            "platforms": platforms,
+            "version": version,
+            "author": author,
+            "product_model": product_model,
+            # Specs vides par défaut (à remplir avec /weightspecs)
+            "specs_general": "",
+            "specs_ae": "",
+            "specs_win": "",
+            "specs_ex": "",
+        }
+
+        weights = load_weights()
+        # Conserver les specs existantes si on édite
+        if self.weight_id and self.weight_id in weights:
+            for key in ["specs_general", "specs_ae", "specs_win", "specs_ex"]:
+                weight_data[key] = weights[self.weight_id].get(key, "")
+
+        if not self.weight_id:
+            # Générer un ID unique
+            weight_id = re.sub(r'[^a-z0-9_]', '_', weight_data["name"].lower())
+            weight_id = f"{weight_id}_{int(time.time())}"
+        else:
+            weight_id = self.weight_id
+
+        weights[weight_id] = weight_data
+        save_weights(weights)
+
+        embed = build_weight_embed(weight_data)
+        view = WeightView(weight_id)
+
+        await interaction.response.send_message(
+            f"✅ Weight **{weight_data['name']}** saved! Preview:",
+            embed=embed,
+            view=view,
+            ephemeral=True,
+        )
+
+
+class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
+    specs_general = discord.ui.TextInput(
+        label="General specs",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=False,
+        placeholder="• Support Team Ignore\n• FOV: 120 (recommended)\n...",
+    )
+    specs_ae = discord.ui.TextInput(
+        label="AE specs",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=False,
+        placeholder="• Model config: [2,0]\n• Class 2: ~72%\n...",
+    )
+    specs_win = discord.ui.TextInput(
+        label="WIN specs",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=False,
+        placeholder="• Target Classes: 2,0\n• Confidence: 50%\n...",
+    )
+    specs_ex = discord.ui.TextInput(
+        label="EX specs",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=False,
+        placeholder="• ...",
+    )
+
+    def __init__(self, weight_id: str, existing: dict = None):
+        super().__init__()
+        self.weight_id = weight_id
+        if existing:
+            self.specs_general.default = existing.get("specs_general", "")
+            self.specs_ae.default = existing.get("specs_ae", "")
+            self.specs_win.default = existing.get("specs_win", "")
+            self.specs_ex.default = existing.get("specs_ex", "")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        weights = load_weights()
+        if self.weight_id not in weights:
+            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+            return
+
+        weights[self.weight_id]["specs_general"] = self.specs_general.value.strip()
+        weights[self.weight_id]["specs_ae"] = self.specs_ae.value.strip()
+        weights[self.weight_id]["specs_win"] = self.specs_win.value.strip()
+        weights[self.weight_id]["specs_ex"] = self.specs_ex.value.strip()
+        save_weights(weights)
+
+        embed = build_specs_embed(weights[self.weight_id])
+        await interaction.response.send_message(
+            f"✅ Specs updated for **{weights[self.weight_id]['name']}**! Preview:",
+            embed=embed,
+            ephemeral=True,
+        )
+
+
+# ─────────────────────────────────────────────
+#  COMMANDES /weight
+# ─────────────────────────────────────────────
+
+async def weight_autocomplete(interaction: discord.Interaction, current: str):
+    weights = load_weights()
+    matches = [
+        (wid, w["name"]) for wid, w in weights.items()
+        if current.lower() in w["name"].lower()
+    ]
+    return [app_commands.Choice(name=name, value=wid) for wid, name in matches[:25]]
+
+
+@tree.command(name="weight", description="Poster l'embed d'un weight dans le salon")
+@app_commands.describe(weight_id="Le weight à poster")
+@app_commands.autocomplete(weight_id=weight_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def weight_cmd(interaction: discord.Interaction, weight_id: str):
+    weights = load_weights()
+    weight_data = weights.get(weight_id)
+    if not weight_data:
+        await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+        return
+
+    embed = build_weight_embed(weight_data)
+    view = WeightView(weight_id)
+
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("✅ Weight posted!", ephemeral=True)
+
+
+@tree.command(name="weightadd", description="Ajouter ou modifier un weight (modal)")
+@app_commands.describe(weight_id="Laisser vide pour créer, ou choisir un weight existant à modifier")
+@app_commands.autocomplete(weight_id=weight_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def weightadd_cmd(interaction: discord.Interaction, weight_id: str = None):
+    existing = None
+    if weight_id:
+        weights = load_weights()
+        existing = weights.get(weight_id)
+        if not existing:
+            await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+            return
+
+    modal = WeightAddModal(weight_id=weight_id, existing=existing)
+    await interaction.response.send_modal(modal)
+
+
+@tree.command(name="weightspecs", description="Éditer les specs d'un weight")
+@app_commands.describe(weight_id="Le weight dont tu veux éditer les specs")
+@app_commands.autocomplete(weight_id=weight_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def weightspecs_cmd(interaction: discord.Interaction, weight_id: str):
+    weights = load_weights()
+    weight_data = weights.get(weight_id)
+    if not weight_data:
+        await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+        return
+    modal = WeightSpecsModal(weight_id=weight_id, existing=weight_data)
+    await interaction.response.send_modal(modal)
+
+
+@tree.command(name="weightdelete", description="Supprimer un weight")
+@app_commands.describe(weight_id="Le weight à supprimer")
+@app_commands.autocomplete(weight_id=weight_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def weightdelete_cmd(interaction: discord.Interaction, weight_id: str):
+    weights = load_weights()
+    if weight_id not in weights:
+        await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
+        return
+    name = weights[weight_id]["name"]
+    del weights[weight_id]
+    save_weights(weights)
+    await interaction.response.send_message(f"🗑️ Weight **{name}** deleted.", ephemeral=True)
+
+
+@tree.command(name="weightlist", description="Lister tous les weights enregistrés")
+@app_commands.checks.has_permissions(administrator=True)
+async def weightlist_cmd(interaction: discord.Interaction):
+    weights = load_weights()
+    if not weights:
+        await interaction.response.send_message("No weights registered.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="📦 Registered Weights", color=EMBED_COLOR)
+    for wid, w in weights.items():
+        platforms = " • ".join(p.upper() for p in w.get("platforms", []))
+        embed.add_field(
+            name=w["name"],
+            value=f"ID: `{wid}`\nPlatforms: {platforms or 'N/A'}\nPrice: {w.get('price_display', 'N/A')}",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  ORDER FLOW (Stripe)
+# ─────────────────────────────────────────────
+
 class ContactOnlyModal(discord.ui.Modal):
     def __init__(self, model_name: str, platform: str):
         if platform == "enginex":
             label = "Your email (for EngineX)"
         else:
             label = "Your Discord ID (for Winsight)"
-
         super().__init__(title="Order Details")
         self.model_name = model_name
         self.platform = platform
@@ -288,15 +848,15 @@ class ContactOnlyModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         products = load_products()
-
         if self.model_name not in products or self.platform not in products[self.model_name]:
             await interaction.response.send_message(
-                f"❌ This model/platform combination is no longer available. Please start over.",
+                "❌ This model/platform combination is no longer available. Please start over.",
                 ephemeral=True,
             )
             return
 
         price_cents = products[self.model_name][self.platform]
+        display_name = get_display_name(self.model_name)
         order_id = f"{interaction.user.id}_{int(time.time() * 1000)}"
 
         try:
@@ -305,7 +865,7 @@ class ContactOnlyModal(discord.ui.Modal):
                 line_items=[{
                     "price_data": {
                         "currency": "eur",
-                        "product_data": {"name": f"Weight: {self.model_name} ({self.platform.capitalize()})"},
+                        "product_data": {"name": f"Weight: {display_name} ({self.platform.capitalize()})"},
                         "unit_amount": price_cents,
                     },
                     "quantity": 1,
@@ -331,16 +891,15 @@ class ContactOnlyModal(discord.ui.Modal):
         embed = discord.Embed(
             title="💳 Complete Your Payment",
             description=(
-                f"**Model:** {self.model_name}\n**Platform:** {self.platform.capitalize()}\n"
+                f"**Model:** {display_name}\n**Platform:** {self.platform.capitalize()}\n"
                 f"**Price:** €{price_cents / 100:.2f}\n\n"
                 f"Click below to pay securely via Stripe. "
-                f"Once paid, your weight will be delivered automatically — no further action needed!"
+                f"Once paid, your weight will be delivered automatically!"
             ),
             color=0xF1C40F,
         )
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(label="Pay Now", url=checkout_session.url, style=discord.ButtonStyle.link))
-
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
@@ -348,7 +907,11 @@ class PlatformSelect(discord.ui.Select):
     def __init__(self, model_name: str, available_platforms: dict):
         self.model_name = model_name
         options = [
-            discord.SelectOption(label=platform.capitalize(), description=f"€{price / 100:.2f}", value=platform)
+            discord.SelectOption(
+                label=platform.capitalize(),
+                description=f"€{price / 100:.2f}",
+                value=platform,
+            )
             for platform, price in available_platforms.items()
         ]
         super().__init__(placeholder="Choose a platform...", options=options)
@@ -372,33 +935,29 @@ class ModelSelect(discord.ui.Select):
             if not platforms:
                 continue
             min_price = min(platforms.values())
+            display = get_display_name(name)
             platform_count = len(platforms)
             if platform_count > 1:
                 desc = f"From €{min_price / 100:.2f} • {platform_count} platforms"
             else:
                 only_platform = next(iter(platforms))
                 desc = f"€{min_price / 100:.2f} • {only_platform.capitalize()}"
-            options.append(discord.SelectOption(label=name, description=desc))
+            options.append(discord.SelectOption(label=display, description=desc, value=name))
         options = options[:25]
-
         if not options:
             options = [discord.SelectOption(label="No products available", value="__none__")]
-
         super().__init__(placeholder="Choose a model...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "__none__":
             await interaction.response.send_message("❌ No products are currently available.", ephemeral=True)
             return
-
         model_name = self.values[0]
         products = load_products()
         available_platforms = products.get(model_name, {})
-
         if not available_platforms:
             await interaction.response.send_message("❌ This model is no longer available.", ephemeral=True)
             return
-
         if len(available_platforms) == 1:
             only_platform = next(iter(available_platforms))
             await interaction.response.send_modal(ContactOnlyModal(model_name, only_platform))
@@ -406,7 +965,7 @@ class ModelSelect(discord.ui.Select):
             platform_view = discord.ui.View(timeout=120)
             platform_view.add_item(PlatformSelect(model_name, available_platforms))
             await interaction.response.send_message(
-                f"**{model_name}** is available on multiple platforms. Which one would you like?",
+                f"**{get_display_name(model_name)}** is available on multiple platforms. Which one?",
                 view=platform_view,
                 ephemeral=True,
             )
@@ -425,6 +984,10 @@ class OrderStartView(discord.ui.View):
         )
 
 
+# ─────────────────────────────────────────────
+#  EVENTS
+# ─────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
     restored = await restore_config_from_discord()
@@ -433,6 +996,13 @@ async def on_ready():
 
     await tree.sync()
     bot.add_view(OrderStartView())
+    bot.add_view(TicketCloseView(0))
+
+    # Ré-enregistrer les WeightViews persistantes
+    weights = load_weights()
+    for weight_id in weights:
+        bot.add_view(WeightView(weight_id))
+
     print(f"✅ Bot connecté en tant que {bot.user} (ID: {bot.user.id})")
 
     if ORDER_PANEL_CHANNEL_ID:
@@ -442,6 +1012,10 @@ async def on_ready():
             await channel.send(embed=embed, view=OrderStartView())
             print(f"📌 Order panel posted in #{channel.name}")
 
+
+# ─────────────────────────────────────────────
+#  COMMANDES ADMIN EXISTANTES
+# ─────────────────────────────────────────────
 
 @tree.command(name="order", description="Poster le panneau de commande Stripe")
 @app_commands.checks.has_permissions(administrator=True)
@@ -467,7 +1041,8 @@ async def addproduct_cmd(interaction: discord.Interaction, model: str, price_eur
     products[model][platform.value] = int(price_eur * 100)
     save_json(PRODUCTS_FILE, products)
     await interaction.response.send_message(
-        f"✅ Product **{model}** set to €{price_eur:.2f} on **{platform.name}**.", ephemeral=True
+        f"✅ Product **{get_display_name(model)}** (`{model}`) set to €{price_eur:.2f} on **{platform.name}**.",
+        ephemeral=True,
     )
     await backup_config_to_discord("addproduct")
 
@@ -478,11 +1053,9 @@ async def addproduct_cmd(interaction: discord.Interaction, model: str, price_eur
 @app_commands.checks.has_permissions(administrator=True)
 async def removeproduct_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str] = None):
     products = load_products()
-
     if model not in products:
         await interaction.response.send_message(f"⚠️ Model **{model}** not found.", ephemeral=True)
         return
-
     if platform:
         if platform.value in products[model]:
             del products[model][platform.value]
@@ -490,7 +1063,7 @@ async def removeproduct_cmd(interaction: discord.Interaction, model: str, platfo
                 del products[model]
             save_json(PRODUCTS_FILE, products)
             await interaction.response.send_message(
-                f"🚫 Removed **{model}** from **{platform.name}**.", ephemeral=True
+                f"🚫 Removed **{get_display_name(model)}** from **{platform.name}**.", ephemeral=True
             )
             await backup_config_to_discord("removeproduct")
         else:
@@ -500,7 +1073,7 @@ async def removeproduct_cmd(interaction: discord.Interaction, model: str, platfo
     else:
         del products[model]
         save_json(PRODUCTS_FILE, products)
-        await interaction.response.send_message(f"🚫 Removed **{model}** from all platforms.", ephemeral=True)
+        await interaction.response.send_message(f"🚫 Removed **{get_display_name(model)}** from all platforms.", ephemeral=True)
         await backup_config_to_discord("removeproduct")
 
 
@@ -511,20 +1084,18 @@ def build_product_list_embed() -> discord.Embed:
         description="Here's everything currently available for purchase:",
         color=EMBED_COLOR,
     )
-
     if not products:
         embed.description = "No products are currently available."
         return embed
-
     for name, platforms in products.items():
         if not platforms:
             continue
+        display = get_display_name(name)
         lines = "\n".join(
             f"● **{platform.capitalize()}** — €{price / 100:.2f}"
             for platform, price in platforms.items()
         )
-        embed.add_field(name=name, value=lines, inline=False)
-
+        embed.add_field(name=display, value=lines, inline=False)
     embed.set_footer(text="Use the Order Now button to purchase!")
     return embed
 
@@ -544,21 +1115,15 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
     print(f"[Winsight] Starting grant for discord_id={discord_id}, model={model_name}")
     try:
         async with async_playwright() as p:
-            print("[Winsight] Launching browser...")
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-
-            print(f"[Winsight] Navigating to {WINSIGHT_URL}")
             await page.goto(WINSIGHT_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
-            print(f"[Winsight] Page loaded, title: {await page.title()}")
 
             login_input = await page.query_selector("input[type='text']")
             if login_input:
-                print("[Winsight] Login form detected, logging in...")
                 await page.fill("input[type='text']", WINSIGHT_USERNAME)
                 await page.fill("input[type='password']", WINSIGHT_PASSWORD)
-
                 clicked = await page.evaluate("""
                     () => {
                         const buttons = document.querySelectorAll("button");
@@ -571,118 +1136,67 @@ async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
                         return false;
                     }
                 """)
-                print(f"[Winsight] Sign in button clicked via JS: {clicked}")
-
                 if not clicked:
                     await page.click("text=SIGN IN", timeout=10000)
-
                 await asyncio.sleep(3)
                 await page.wait_for_load_state("networkidle", timeout=30000)
-                print(f"[Winsight] Logged in, new title: {await page.title()}")
-
-                still_login = await page.query_selector("input[type='password']")
-                if still_login:
-                    print("[Winsight] WARNING: still on login screen after sign-in attempt.")
-                    page_text_debug = await page.evaluate("() => document.body.innerText.substring(0, 500)")
-                    print(f"[Winsight] Page text after login attempt: {page_text_debug}")
-            else:
-                print("[Winsight] No login form found (already logged in?)")
-
-            print(f"[Winsight] Searching for model '{model_name}' on page...")
 
             match_info = await page.evaluate(f"""
                 () => {{
                     const modelName = "{model_name}".toLowerCase();
                     const allElements = document.querySelectorAll("*");
                     let matchEl = null;
-
                     for (const el of allElements) {{
                         let directText = "";
                         for (const node of el.childNodes) {{
-                            if (node.nodeType === Node.TEXT_NODE) {{
-                                directText += node.textContent;
-                            }}
+                            if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
                         }}
-                        if (directText.toLowerCase().includes(modelName)) {{
-                            matchEl = el;
-                            break;
-                        }}
+                        if (directText.toLowerCase().includes(modelName)) {{ matchEl = el; break; }}
                     }}
-
                     if (!matchEl) return {{ status: "not_found" }};
-
                     let parent = matchEl;
                     for (let i = 0; i < 12; i++) {{
                         parent = parent.parentElement;
                         if (!parent) break;
-
                         const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']");
                         const buttons = parent.querySelectorAll("button");
                         let shareBtn = null;
                         for (const btn of buttons) {{
-                            if (btn.textContent.toUpperCase().includes("SHARE")) {{
-                                shareBtn = btn;
-                                break;
-                            }}
+                            if (btn.textContent.toUpperCase().includes("SHARE")) {{ shareBtn = btn; break; }}
                         }}
-
                         if (input && shareBtn) {{
                             input.setAttribute("data-bot-target-input", "true");
                             shareBtn.setAttribute("data-bot-target-button", "true");
-                            return {{
-                                status: "found",
-                                matchedText: matchEl.textContent.trim().substring(0, 100)
-                            }};
+                            return {{ status: "found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
                         }}
                     }}
-
                     return {{ status: "container_not_found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
                 }}
             """)
-            print(f"[Winsight] Match info: {match_info}")
 
+            found = "not_found"
             if match_info["status"] == "found":
                 input_locator = page.locator("[data-bot-target-input='true']")
                 await input_locator.click()
                 await input_locator.fill("")
                 await input_locator.type(discord_id, delay=30)
                 await asyncio.sleep(0.5)
-
-                filled_value = await input_locator.input_value()
-                print(f"[Winsight] Input filled, current value: '{filled_value}'")
-
                 share_button = page.locator("[data-bot-target-button='true']")
                 await share_button.click()
-                print("[Winsight] Share button clicked via Playwright locator.")
-
                 found = "clicked"
             else:
                 found = match_info["status"]
 
-            print(f"[Winsight] Search result: {found}")
-
-            if found == "not_found":
-                debug_html = await page.evaluate("""
-                    () => {
-                        const body = document.body.innerText;
-                        return body.substring(0, 2000);
-                    }
-                """)
-                print(f"[Winsight] DEBUG page text content:\n{debug_html}")
-
             await asyncio.sleep(2)
             await browser.close()
-            print("[Winsight] Browser closed.")
 
             if found == "clicked":
                 return True, f"Access granted to {discord_id} for {model_name} on Winsight."
             elif found == "container_not_found":
-                return False, f"Found model name '{model_name}' but couldn't locate its input/share button container."
+                return False, f"Found model '{model_name}' but couldn't locate input/share button."
             else:
                 return False, f"Could not find model '{model_name}' on Winsight."
-
     except Exception as e:
-        print(f"[Winsight] EXCEPTION: {str(e)}")
         return False, f"Error: {str(e)}"
 
 
@@ -697,39 +1211,25 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
     print(f"[EngineX] Starting grant for email={email}, model={model_name}")
     try:
         async with async_playwright() as p:
-            print("[EngineX] Launching browser...")
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-
-            print(f"[EngineX] Navigating to login page {ENGINEX_LOGIN_URL}")
             await page.goto(ENGINEX_LOGIN_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
-
-            print("[EngineX] Filling login form...")
             await page.locator("input[type='email'], input[name='email']").first.fill(ENGINEX_USERNAME)
             await page.locator("input[type='password']").first.fill(ENGINEX_PASSWORD)
-
             clicked = await page.evaluate("""
                 () => {
                     const buttons = document.querySelectorAll("button");
                     for (const btn of buttons) {
-                        if (btn.textContent.toUpperCase().includes("SIGN IN")) {
-                            btn.click();
-                            return true;
-                        }
+                        if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
                     }
                     return false;
                 }
             """)
-            print(f"[EngineX] Sign in button clicked via JS: {clicked}")
             if not clicked:
                 await page.click("text=Sign in", timeout=10000)
-
             await asyncio.sleep(3)
             await page.wait_for_load_state("networkidle", timeout=30000)
-            print(f"[EngineX] Logged in, current URL: {page.url}")
-
-            print(f"[EngineX] Navigating to entitlements page {ENGINEX_ENTITLEMENTS_URL}")
             await page.goto(ENGINEX_ENTITLEMENTS_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
 
@@ -737,196 +1237,118 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
                 () => {
                     const buttons = document.querySelectorAll("button");
                     for (const btn of buttons) {
-                        if (btn.textContent.toUpperCase().includes("GRANT ACCESS")) {
-                            btn.click();
-                            return true;
-                        }
+                        if (btn.textContent.toUpperCase().includes("GRANT ACCESS")) { btn.click(); return true; }
                     }
                     return false;
                 }
             """)
-            print(f"[EngineX] 'Grant Access' button clicked: {grant_clicked}")
             if not grant_clicked:
                 await browser.close()
-                return False, "Could not find 'Grant Access' button on entitlements page."
+                return False, "Could not find 'Grant Access' button."
 
             await asyncio.sleep(1)
-
             search_input = page.locator("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']").first
             await search_input.click()
             await search_input.fill("")
             await search_input.type(email, delay=30)
-            print(f"[EngineX] Typed email into search field: {email}")
-
             await asyncio.sleep(1.5)
-
-            debug_dropdown_html = await page.evaluate("""
-                () => {
-                    const input = document.querySelector("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']");
-                    if (!input) return "input_not_found";
-                    let container = input.parentElement;
-                    for (let i = 0; i < 3; i++) {
-                        if (!container) break;
-                        container = container.parentElement;
-                    }
-                    return container ? container.outerHTML.substring(0, 3000) : "container_not_found";
-                }
-            """)
-            print(f"[EngineX] DEBUG dropdown area HTML:\n{debug_dropdown_html}")
 
             result_clicked = False
             try:
                 result_locator = page.locator("div[style*='cursor: pointer']").first
                 await result_locator.click(timeout=5000)
                 result_clicked = True
-                print("[EngineX] Search result clicked via cursor:pointer div locator.")
-            except Exception as e:
-                print(f"[EngineX] cursor:pointer click failed: {e}")
-
+            except Exception:
                 try:
                     result_locator = page.locator(f"*:not(input):has-text('{email}')").last
                     parent_locator = result_locator.locator("xpath=..")
                     await parent_locator.click(timeout=5000)
                     result_clicked = True
-                    print("[EngineX] Search result clicked via parent element fallback.")
-                except Exception as e2:
-                    print(f"[EngineX] Parent click fallback also failed: {e2}")
-
-            print(f"[EngineX] Search result clicked: {result_clicked}")
+                except Exception:
+                    pass
 
             if not result_clicked:
                 await browser.close()
-                return False, f"Could not find user matching email '{email}' in search results."
+                return False, f"Could not find user matching email '{email}'."
 
             await asyncio.sleep(0.8)
-
-            search_field_state = await page.evaluate("""
-                () => {
-                    const input = document.querySelector("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']");
-                    return input ? input.value : "field_gone";
-                }
-            """)
-            print(f"[EngineX] Search field state after selection: '{search_field_state}'")
-
             model_label = await page.evaluate(f"""
                 () => {{
                     const modelName = "{model_name}".toLowerCase();
                     const selects = document.querySelectorAll("select");
                     for (const select of selects) {{
                         for (const option of select.options) {{
-                            if (option.textContent.toLowerCase().includes(modelName)) {{
-                                return option.textContent;
-                            }}
+                            if (option.textContent.toLowerCase().includes(modelName)) return option.textContent;
                         }}
                     }}
                     return null;
                 }}
             """)
-            print(f"[EngineX] Found dropdown option label: {model_label}")
 
             model_selected = False
             if model_label:
                 try:
-                    select_locator = page.locator("select").first
-                    await select_locator.select_option(label=model_label)
+                    await page.locator("select").first.select_option(label=model_label)
                     model_selected = True
-                except Exception as e:
-                    print(f"[EngineX] select_option failed: {e}")
-
-            print(f"[EngineX] Model '{model_name}' selected in dropdown: {model_selected}")
+                except Exception:
+                    pass
 
             if not model_selected:
                 await browser.close()
-                return False, f"Could not find model '{model_name}' in the dropdown."
+                return False, f"Could not find model '{model_name}' in dropdown."
 
             await asyncio.sleep(0.5)
-
-            button_disabled = await page.evaluate("""
-                () => {
-                    const buttons = document.querySelectorAll("button[type='submit']");
-                    for (const btn of buttons) {
-                        if (btn.textContent.trim().toUpperCase() === "GRANT ACCESS") {
-                            return btn.disabled;
-                        }
-                    }
-                    return null;
-                }
-            """)
-            print(f"[EngineX] Grant Access button disabled state before click: {button_disabled}")
-
             final_clicked = await page.evaluate("""
                 () => {
                     const buttons = document.querySelectorAll("button");
                     for (const btn of buttons) {
-                        if (btn.textContent.trim().toUpperCase() === "GRANT ACCESS") {
-                            btn.click();
-                            return true;
-                        }
+                        if (btn.textContent.trim().toUpperCase() === "GRANT ACCESS") { btn.click(); return true; }
                     }
                     return false;
                 }
             """)
-            print(f"[EngineX] Final 'Grant Access' click: {final_clicked}")
-
             await asyncio.sleep(2)
-
             modal_still_open = await page.evaluate("""
                 () => {
                     const body = document.body.innerText;
                     return body.includes("Grant Model Access") && body.includes("Select a user and a model");
                 }
             """)
-            print(f"[EngineX] Modal still open after final click: {modal_still_open}")
-
             await browser.close()
-            print("[EngineX] Browser closed.")
 
             if final_clicked and not modal_still_open:
                 return True, f"Access granted to {email} for {model_name} on EngineX."
-            elif final_clicked and modal_still_open:
-                return False, "Clicked Grant Access but modal is still open — action likely did not register."
+            elif final_clicked:
+                return False, "Clicked Grant Access but modal is still open."
             else:
                 return False, "Could not click final 'Grant Access' button."
-
     except Exception as e:
-        print(f"[EngineX] EXCEPTION: {str(e)}")
         return False, f"Error: {str(e)}"
 
 
 async def process_paid_order(order_id: str):
-    print(f"[Order] Processing paid order: {order_id}")
     order = get_order(order_id)
     if not order:
-        print(f"❌ Order {order_id} not found.")
         return
-
-    print(f"[Order] Order data: {order}")
     update_order(order_id, status="processing")
-
     platform = order.get("platform", "winsight")
-    print(f"[Order] Routing to platform: {platform}")
 
     if platform == "enginex":
         success, message = await enginex_grant(order["buyer_contact"], order["model"])
     else:
         success, message = await winsight_grant(order["buyer_contact"], order["model"])
 
-    print(f"[Order] Grant result: success={success}, message={message}")
-
-    if success:
-        update_order(order_id, status="delivered")
-    else:
-        update_order(order_id, status="failed")
+    update_order(order_id, status="delivered" if success else "failed")
 
     if STAFF_CHANNEL_ID:
         channel = bot.get_channel(STAFF_CHANNEL_ID)
         if channel:
             color = 0x57F287 if success else 0xED4245
-            title = "✅ Order Delivered Automatically" if success else "❌ Auto-Delivery Failed — Manual Action Needed"
+            title = "✅ Order Delivered Automatically" if success else "❌ Auto-Delivery Failed"
             embed = discord.Embed(title=title, color=color)
             embed.add_field(name="Buyer", value=f"<@{order['buyer_id']}>", inline=True)
             embed.add_field(name="Contact", value=order["buyer_contact"], inline=True)
-            embed.add_field(name="Model", value=order["model"], inline=False)
+            embed.add_field(name="Model", value=get_display_name(order["model"]), inline=False)
             embed.add_field(name="Details", value=message, inline=False)
             embed.set_footer(text=f"Order ID: {order_id}")
             await channel.send(embed=embed)
@@ -936,74 +1358,28 @@ async def process_paid_order(order_id: str):
         try:
             if success:
                 await buyer.send(
-                    f"✅ Your payment was received and **{order['model']}** has been added to your Winsight account!"
+                    f"✅ Your payment was received and **{get_display_name(order['model'])}** has been added to your account!"
                 )
             else:
                 await buyer.send(
-                    f"⚠️ Your payment for **{order['model']}** was received, but automatic delivery failed. "
-                    f"Our team has been notified and will resolve this manually shortly."
+                    f"⚠️ Your payment for **{get_display_name(order['model'])}** was received, but automatic delivery failed. "
+                    f"Our team has been notified and will resolve this manually."
                 )
         except discord.Forbidden:
             pass
 
 
 # ─────────────────────────────────────────────
-#  SERVEUR WEB FLASK (webhook Stripe)
-# ─────────────────────────────────────────────
-
-flask_app = Flask(__name__)
-
-
-@flask_app.route("/stripe-webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature")
-
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except (ValueError, stripe.error.SignatureVerificationError):
-        return jsonify({"error": "Invalid signature"}), 400
-
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        metadata = session["metadata"] if "metadata" in session else {}
-        order_id = metadata["order_id"] if metadata and "order_id" in metadata else None
-
-        print(f"[Webhook] checkout.session.completed received, order_id={order_id}, main_loop set={main_loop is not None}")
-
-        if order_id and main_loop:
-            asyncio.run_coroutine_threadsafe(process_paid_order(order_id), main_loop)
-            print(f"[Webhook] Scheduled process_paid_order for {order_id}")
-        else:
-            print(f"[Webhook] NOT scheduled — order_id={order_id}, main_loop={main_loop}")
-
-    return jsonify({"status": "ok"}), 200
-
-
-@flask_app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-
-def run_flask():
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port)
-
-
-# ─────────────────────────────────────────────
-#  VÉRIFICATION D'ACCÈS (lecture seule)
+#  VÉRIFICATION / REVOKE D'ACCÈS
 # ─────────────────────────────────────────────
 
 async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
-    print(f"[Winsight Check] Checking access for discord_id={discord_id}, model={model_name}")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-
             await page.goto(WINSIGHT_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
-
             login_input = await page.query_selector("input[type='text']")
             if login_input:
                 await page.fill("input[type='text']", WINSIGHT_USERNAME)
@@ -1012,12 +1388,8 @@ async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
                     () => {
                         const buttons = document.querySelectorAll("button");
                         for (const btn of buttons) {
-                            if (btn.textContent.toUpperCase().includes("SIGN IN")) {
-                                btn.click();
-                                return true;
-                            }
+                            if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
                         }
-                        return false;
                     }
                 """)
                 await asyncio.sleep(3)
@@ -1029,38 +1401,25 @@ async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
                     const discordId = "{discord_id}";
                     const allElements = document.querySelectorAll("*");
                     let matchEl = null;
-
                     for (const el of allElements) {{
                         let directText = "";
                         for (const node of el.childNodes) {{
-                            if (node.nodeType === Node.TEXT_NODE) {{
-                                directText += node.textContent;
-                            }}
+                            if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
                         }}
-                        if (directText.toLowerCase().includes(modelName)) {{
-                            matchEl = el;
-                            break;
-                        }}
+                        if (directText.toLowerCase().includes(modelName)) {{ matchEl = el; break; }}
                     }}
-
                     if (!matchEl) return null;
-
                     let parent = matchEl;
                     for (let i = 0; i < 12; i++) {{
                         parent = parent.parentElement;
                         if (!parent) break;
-                        if (parent.textContent.includes(discordId)) {{
-                            return true;
-                        }}
+                        if (parent.textContent.includes(discordId)) return true;
                         const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer']");
-                        if (input) {{
-                            return false;
-                        }}
+                        if (input) return false;
                     }}
                     return null;
                 }}
             """)
-
             await browser.close()
 
             if has_access is True:
@@ -1068,23 +1427,18 @@ async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
             elif has_access is False:
                 return False, f"❌ {discord_id} does NOT have access to **{model_name}** on Winsight."
             else:
-                return False, f"⚠️ Could not determine access (model not found or page structure unclear)."
-
+                return False, "⚠️ Could not determine access."
     except Exception as e:
-        print(f"[Winsight Check] EXCEPTION: {str(e)}")
-        return False, f"Error checking Winsight: {str(e)}"
+        return False, f"Error: {str(e)}"
 
 
 async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
-    print(f"[Winsight Revoke] Starting revoke for discord_id={discord_id}, model={model_name}")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-
             await page.goto(WINSIGHT_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
-
             login_input = await page.query_selector("input[type='text']")
             if login_input:
                 await page.fill("input[type='text']", WINSIGHT_USERNAME)
@@ -1093,12 +1447,8 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
                     () => {
                         const buttons = document.querySelectorAll("button");
                         for (const btn of buttons) {
-                            if (btn.textContent.toUpperCase().includes("SIGN IN")) {
-                                btn.click();
-                                return true;
-                            }
+                            if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
                         }
-                        return false;
                     }
                 """)
                 await asyncio.sleep(3)
@@ -1109,69 +1459,52 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
                 model_card = title_el
                 chip_locator = None
                 count = 0
-
                 for _ in range(8):
-                    chip_locator = model_card.locator(
-                        f"[data-testid*='badge-share'][data-testid*='{discord_id}']"
-                    )
+                    chip_locator = model_card.locator(f"[data-testid*='badge-share'][data-testid*='{discord_id}']")
                     count = await chip_locator.count()
                     if count > 0:
                         break
                     model_card = model_card.locator("xpath=..")
 
-                print(f"[Winsight Revoke] Found {count} matching chip(s) for discord_id={discord_id}")
-
                 if count == 0:
                     await browser.close()
-                    return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}** on Winsight."
+                    return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}**."
 
-                chip_locator = chip_locator.first
-                await chip_locator.click(timeout=5000)
+                await chip_locator.first.click(timeout=5000)
                 result = "clicked"
             except Exception as e:
-                print(f"[Winsight Revoke] Click failed: {e}")
                 result = "click_failed"
 
             await asyncio.sleep(2)
             await browser.close()
 
             if result == "clicked":
-                return True, f"✅ Access revoked for {discord_id} on **{model_name}** (Winsight)."
+                return True, f"✅ Access revoked for {discord_id} on **{model_name}**."
             else:
-                return False, f"❌ Found the chip but couldn't click the remove button (result: {result})."
-
+                return False, "❌ Found chip but couldn't click remove."
     except Exception as e:
-        print(f"[Winsight Revoke] EXCEPTION: {str(e)}")
-        return False, f"Error revoking on Winsight: {str(e)}"
+        return False, f"Error: {str(e)}"
 
 
 async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
-    print(f"[EngineX Check] Checking access for email={email}, model={model_name}")
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-
             await page.goto(ENGINEX_LOGIN_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
-
             await page.locator("input[type='email'], input[name='email']").first.fill(ENGINEX_USERNAME)
             await page.locator("input[type='password']").first.fill(ENGINEX_PASSWORD)
             await page.evaluate("""
                 () => {
                     const buttons = document.querySelectorAll("button");
                     for (const btn of buttons) {
-                        if (btn.textContent.toUpperCase().includes("SIGN IN")) {
-                            btn.click();
-                            return true;
-                        }
+                        if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
                     }
-                    return false;
                 }
             """)
             await asyncio.sleep(3)
             await page.wait_for_load_state("networkidle", timeout=30000)
-
             await page.goto(ENGINEX_ENTITLEMENTS_URL, timeout=30000)
             await page.wait_for_load_state("networkidle", timeout=30000)
 
@@ -1180,7 +1513,6 @@ async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
                     const emailLower = "{email}".toLowerCase();
                     const modelName = "{model_name}".toLowerCase();
                     const rows = document.querySelectorAll("tr, [class*='row']");
-
                     for (const row of rows) {{
                         if (row.textContent.toLowerCase().includes(emailLower)) {{
                             return row.textContent.toLowerCase().includes(modelName);
@@ -1189,7 +1521,6 @@ async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
                     return null;
                 }}
             """)
-
             await browser.close()
 
             if has_access is True:
@@ -1197,21 +1528,22 @@ async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
             elif has_access is False:
                 return False, f"❌ {email} does NOT have access to **{model_name}** on EngineX."
             else:
-                return False, f"⚠️ Could not find {email} in the entitlements list."
-
+                return False, f"⚠️ Could not find {email} in entitlements."
     except Exception as e:
-        print(f"[EngineX Check] EXCEPTION: {str(e)}")
-        return False, f"Error checking EngineX: {str(e)}"
+        return False, f"Error: {str(e)}"
 
 
 # ─────────────────────────────────────────────
-#  COMMANDES MANUELLES — avec autocomplete
+#  COMMANDES MANUELLES
 # ─────────────────────────────────────────────
 
 async def model_autocomplete(interaction: discord.Interaction, current: str):
     products = load_products()
     matches = [name for name in products.keys() if current.lower() in name.lower()]
-    return [app_commands.Choice(name=name, value=name) for name in matches[:25]]
+    return [
+        app_commands.Choice(name=get_display_name(name), value=name)
+        for name in matches[:25]
+    ]
 
 
 async def pipeline_autocomplete(interaction: discord.Interaction, current: str):
@@ -1221,29 +1553,22 @@ async def pipeline_autocomplete(interaction: discord.Interaction, current: str):
 
 
 def get_platforms_for_model(model_name: str) -> list:
-    products = load_products()
-    return list(products.get(model_name, {}).keys())
+    return list(load_products().get(model_name, {}).keys())
 
 
 @tree.command(name="setpipeline", description="Enregistrer le nom exact d'une pipeline sur Winsight")
-@app_commands.describe(
-    pipeline="Nom court à utiliser dans Discord",
-    site_name="Nom exact de la pipeline tel qu'il apparaît sur Winsight",
-)
 @app_commands.checks.has_permissions(administrator=True)
 async def setpipeline_cmd(interaction: discord.Interaction, pipeline: str, site_name: str):
     pipelines = load_pipelines()
     pipelines[pipeline] = site_name
     save_pipelines(pipelines)
     await interaction.response.send_message(
-        f"✅ Pipeline **{pipeline}** enregistrée avec le nom Winsight exact: `{site_name}`.",
-        ephemeral=False,
+        f"✅ Pipeline **{pipeline}** → `{site_name}`.", ephemeral=False
     )
     await backup_config_to_discord("setpipeline")
 
 
 @tree.command(name="removepipeline", description="Supprimer une pipeline enregistrée")
-@app_commands.describe(pipeline="Pipeline à supprimer")
 @app_commands.autocomplete(pipeline=pipeline_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def removepipeline_cmd(interaction: discord.Interaction, pipeline: str):
@@ -1251,7 +1576,6 @@ async def removepipeline_cmd(interaction: discord.Interaction, pipeline: str):
     if pipeline not in pipelines:
         await interaction.response.send_message(f"⚠️ Pipeline **{pipeline}** introuvable.", ephemeral=False)
         return
-
     del pipelines[pipeline]
     save_pipelines(pipelines)
     await interaction.response.send_message(f"🚫 Pipeline **{pipeline}** supprimée.", ephemeral=False)
@@ -1265,39 +1589,27 @@ async def pipelinelist_cmd(interaction: discord.Interaction):
     if not pipelines:
         await interaction.response.send_message("Aucune pipeline enregistrée.", ephemeral=False)
         return
-
     lines = [f"● **{name}** → `{site_name}`" for name, site_name in pipelines.items()]
-    embed = discord.Embed(
-        title="Pipelines Winsight enregistrées",
-        description="\n".join(lines),
-        color=EMBED_COLOR,
-    )
+    embed = discord.Embed(title="Pipelines Winsight", description="\n".join(lines), color=EMBED_COLOR)
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 @tree.command(name="pipelineadd", description="Ajouter une pipeline Winsight à un utilisateur")
-@app_commands.describe(
-    pipeline="Pipeline enregistrée à ajouter",
-    discord_id="ID Discord du client sur Winsight",
-)
 @app_commands.autocomplete(pipeline=pipeline_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, discord_id: str):
     pipelines = load_pipelines()
     if pipeline not in pipelines:
         await interaction.response.send_message(
-            f"❌ Pipeline **{pipeline}** introuvable. Utilise d'abord `/setpipeline` avec le nom exact Winsight.",
-            ephemeral=False,
+            f"❌ Pipeline **{pipeline}** introuvable.", ephemeral=False
         )
         return
-
     site_name = pipelines[pipeline]
     await interaction.response.send_message(
-        f"⏳ Adding pipeline **{pipeline}** (`{site_name}` on Winsight) to `{discord_id}`...",
-        ephemeral=False,
+        f"⏳ Adding pipeline **{pipeline}** to `{discord_id}`...", ephemeral=False
     )
 
-    async def run_pipeline_add():
+    async def run():
         success, message = await winsight_grant_pipeline(discord_id, site_name)
         embed = discord.Embed(
             title=f"✅ Pipeline Added — {pipeline}" if success else "❌ Pipeline Add Failed",
@@ -1309,15 +1621,10 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
         embed.set_footer(text=f"Pipeline Add • by {interaction.user}")
         await interaction.followup.send(embed=embed, ephemeral=False)
 
-    asyncio.create_task(run_pipeline_add())
+    asyncio.create_task(run())
 
 
-@tree.command(name="grantaccess", description="Donner manuellement l'accès à un modèle (paiement hors Stripe)")
-@app_commands.describe(
-    model="Le modèle à donner",
-    platform="La plateforme (Winsight ou EngineX)",
-    contact="ID Discord (Winsight) ou email (EngineX) du client",
-)
+@tree.command(name="grantaccess", description="Donner manuellement l'accès à un modèle")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
@@ -1325,82 +1632,43 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
     available = get_platforms_for_model(model)
     if platform.value not in available:
         await interaction.response.send_message(
-            f"❌ **{model}** is not configured on **{platform.name}**. Available platforms: {', '.join(available) or 'none'}",
-            ephemeral=True,
+            f"❌ **{get_display_name(model)}** not configured on **{platform.name}**.", ephemeral=True
         )
         return
-
     await interaction.response.send_message(
-        f"⏳ Granting **{model}** on **{platform.name}** to `{contact}`...", ephemeral=True
+        f"⏳ Granting **{get_display_name(model)}** on **{platform.name}** to `{contact}`...", ephemeral=True
     )
 
-    async def run_grant():
+    async def run():
         if platform.value == "enginex":
             success, message = await enginex_grant(contact, model)
         else:
             success, message = await winsight_grant(contact, model)
 
+        display = get_display_name(model)
         if success:
-            # Titre style capture : "✅ WIN Granted — Model" ou "✅ EX Granted — Model"
-            if platform.value == "winsight":
-                title = f"✅ WIN Granted — {model}"
-            else:
-                title = f"✅ EX Granted — {model}"
-
+            title = f"✅ {'WIN' if platform.value == 'winsight' else 'EX'} Granted — {display}"
             embed = discord.Embed(title=title, color=0x57F287)
-            embed.description = f"✓ {model}"
-
+            embed.description = f"✓ {display}"
             if platform.value == "winsight":
                 embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
             else:
-                # Pour EngineX on n'a pas de Discord ID, on affiche l'email
-                embed.add_field(name="Discord User", value=f"N/A (manual grant)", inline=False)
                 embed.add_field(name="EngineX Email", value=contact, inline=False)
-
             embed.add_field(name="Result", value="1 granted", inline=False)
             embed.set_footer(text=f"Manual Grant • by {interaction.user}")
         else:
-            title = "❌ Manual Grant Failed"
-            embed = discord.Embed(
-                title=title,
-                description=message,
-                color=0xED4245,
-            )
+            embed = discord.Embed(title="❌ Manual Grant Failed", description=message, color=0xED4245)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
-
-        # Poster aussi dans le salon staff si configuré
         if STAFF_CHANNEL_ID:
             channel = bot.get_channel(STAFF_CHANNEL_ID)
             if channel:
-                if success:
-                    staff_embed = discord.Embed(title=title, color=0x57F287)
-                    staff_embed.description = f"✓ {model}"
-                    if platform.value == "winsight":
-                        staff_embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
-                    else:
-                        staff_embed.add_field(name="Discord User", value=f"N/A (manual grant)", inline=False)
-                        staff_embed.add_field(name="EngineX Email", value=contact, inline=False)
-                    staff_embed.add_field(name="Result", value="1 granted — Manual", inline=False)
-                    staff_embed.set_footer(text=f"Granted by {interaction.user} • Manual")
-                else:
-                    staff_embed = discord.Embed(
-                        title="❌ Manual Grant Failed",
-                        description=message,
-                        color=0xED4245,
-                    )
-                    staff_embed.set_footer(text=f"Attempted by {interaction.user}")
-                await channel.send(embed=staff_embed)
+                await channel.send(embed=embed)
 
-    asyncio.create_task(run_grant())
+    asyncio.create_task(run())
 
 
-@tree.command(name="checkaccess", description="Vérifier si un client a déjà accès à un modèle")
-@app_commands.describe(
-    model="Le modèle à vérifier",
-    platform="La plateforme (Winsight ou EngineX)",
-    contact="ID Discord (Winsight) ou email (EngineX) du client",
-)
+@tree.command(name="checkaccess", description="Vérifier si un client a accès à un modèle")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
@@ -1408,48 +1676,39 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
     available = get_platforms_for_model(model)
     if platform.value not in available:
         await interaction.response.send_message(
-            f"❌ **{model}** is not configured on **{platform.name}**. Available platforms: {', '.join(available) or 'none'}",
-            ephemeral=True,
+            f"❌ **{get_display_name(model)}** not configured on **{platform.name}**.", ephemeral=True
         )
         return
-
     await interaction.response.send_message(
-        f"⏳ Checking **{model}** on **{platform.name}** for `{contact}`...", ephemeral=True
+        f"⏳ Checking **{get_display_name(model)}** for `{contact}`...", ephemeral=True
     )
 
-    async def run_check():
+    async def run():
         if platform.value == "enginex":
             success, message = await enginex_check(contact, model)
         else:
             success, message = await winsight_check(contact, model)
-
         embed = discord.Embed(title="🔍 Access Check Result", description=message, color=0x5865F2)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    asyncio.create_task(run_check())
+    asyncio.create_task(run())
 
 
-@tree.command(name="revoke", description="Retirer l'accès d'un client à un modèle (Winsight uniquement pour l'instant)")
-@app_commands.describe(
-    model="Le modèle à retirer",
-    contact="ID Discord du client (Winsight uniquement)",
-)
+@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight uniquement)")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str):
     available = get_platforms_for_model(model)
     if "winsight" not in available:
         await interaction.response.send_message(
-            f"❌ **{model}** is not configured on Winsight. /revoke currently only supports Winsight.",
-            ephemeral=True,
+            f"❌ **{get_display_name(model)}** not on Winsight.", ephemeral=True
         )
         return
-
     await interaction.response.send_message(
-        f"⏳ Revoking access to **{model}** on **Winsight** for `{contact}`...", ephemeral=True
+        f"⏳ Revoking **{get_display_name(model)}** for `{contact}`...", ephemeral=True
     )
 
-    async def run_revoke():
+    async def run():
         success, message = await winsight_revoke(contact, model)
         embed = discord.Embed(
             title="✅ Access Revoked" if success else "❌ Revoke Failed",
@@ -1458,11 +1717,11 @@ async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str)
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    asyncio.create_task(run_revoke())
+    asyncio.create_task(run())
 
 
 # ─────────────────────────────────────────────
-#  COMMANDE /vouch — témoignages clients
+#  VOUCH
 # ─────────────────────────────────────────────
 
 class VouchModal(discord.ui.Modal, title="Leave a Vouch"):
@@ -1480,30 +1739,16 @@ class VouchModal(discord.ui.Modal, title="Leave a Vouch"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if not VOUCH_CHANNEL_ID:
-            await interaction.response.send_message(
-                "⚠️ Vouch channel is not configured. Please contact an admin.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("⚠️ Vouch channel not configured.", ephemeral=True)
             return
-
         channel = bot.get_channel(VOUCH_CHANNEL_ID)
         if not channel:
-            await interaction.response.send_message(
-                "⚠️ Could not find the vouch channel. Please contact an admin.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("⚠️ Could not find vouch channel.", ephemeral=True)
             return
-
         stars = "⭐" * self.rating + "☆" * (5 - self.rating)
-
-        embed = discord.Embed(
-            title=f"{stars}",
-            description=str(self.text_input.value),
-            color=0xF1C40F,
-        )
+        embed = discord.Embed(title=stars, description=str(self.text_input.value), color=0xF1C40F)
         embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
         embed.set_footer(text=f"Rating: {self.rating}/5")
-
         await channel.send(embed=embed)
         await interaction.response.send_message("✅ Thank you for your feedback!", ephemeral=True)
 
@@ -1517,15 +1762,50 @@ class RatingSelect(discord.ui.Select):
         super().__init__(placeholder="Choose a rating...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        rating = int(self.values[0])
-        await interaction.response.send_modal(VouchModal(rating))
+        await interaction.response.send_modal(VouchModal(int(self.values[0])))
 
 
-@tree.command(name="vouch", description="Laisser un témoignage sur votre expérience")
+@tree.command(name="vouch", description="Laisser un témoignage")
 async def vouch_cmd(interaction: discord.Interaction):
     view = discord.ui.View(timeout=120)
     view.add_item(RatingSelect())
     await interaction.response.send_message("How would you rate your experience?", view=view, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  FLASK (webhook Stripe)
+# ─────────────────────────────────────────────
+
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/stripe-webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.error.SignatureVerificationError):
+        return jsonify({"error": "Invalid signature"}), 400
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        metadata = session.get("metadata", {})
+        order_id = metadata.get("order_id")
+        if order_id and main_loop:
+            asyncio.run_coroutine_threadsafe(process_paid_order(order_id), main_loop)
+
+    return jsonify({"status": "ok"}), 200
+
+
+@flask_app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host="0.0.0.0", port=port)
 
 
 # ─────────────────────────────────────────────
