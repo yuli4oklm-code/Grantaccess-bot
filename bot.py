@@ -451,76 +451,118 @@ class WeightView(discord.ui.View):
             return
 
         guild = interaction.guild
+        weight_name = weight_data.get("name", "Unknown")
+        price_display = weight_data.get("price_display", "")
+
+        # ── Préfixe du salon ticket ──
+        prefix = weight_data.get("ticket_name_prefix", "").strip() or "ticket"
+        safe_username = interaction.user.name.lower().replace(' ', '-')
+        ticket_name = f"{prefix}-{safe_username}"
+
+        # ── Catégorie : priorité à celle du weight, sinon TICKET_CATEGORY_ID global ──
         category = None
-        if TICKET_CATEGORY_ID:
+        custom_cat_id = weight_data.get("ticket_category_id", "").strip()
+        if custom_cat_id:
+            try:
+                category = guild.get_channel(int(custom_cat_id))
+            except ValueError:
+                pass
+        if category is None and TICKET_CATEGORY_ID:
             category = guild.get_channel(TICKET_CATEGORY_ID)
 
-        # Vérifier si l'utilisateur a déjà un ticket ouvert pour ce weight
-        ticket_name = f"ticket-{interaction.user.name.lower().replace(' ', '-')}"
+        # ── Vérifier ticket déjà ouvert ──
         existing = discord.utils.get(guild.text_channels, name=ticket_name)
         if existing:
             await interaction.response.send_message(
-                f"❌ You already have an open ticket: {existing.mention}", ephemeral=True
+                f"❌ Tu as déjà un ticket ouvert : {existing.mention}", ephemeral=True
             )
             return
 
-        # Créer le salon ticket
+        # ── Permissions de base ──
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
         }
-        # Donner accès aux admins
+
+        # Admins toujours inclus
         for role in guild.roles:
             if role.permissions.administrator:
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
+        # Rôles staff personnalisés définis dans le weight
+        staff_roles_raw = weight_data.get("ticket_staff_roles", "").strip()
+        staff_role_objects = []
+        if staff_roles_raw:
+            for rid in staff_roles_raw.split(","):
+                rid = rid.strip()
+                if not rid:
+                    continue
+                try:
+                    role = guild.get_role(int(rid))
+                    if role:
+                        overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+                        staff_role_objects.append(role)
+                except ValueError:
+                    pass
+
+        # ── Créer le salon ──
         try:
             ticket_channel = await guild.create_text_channel(
                 name=ticket_name,
                 category=category,
                 overwrites=overwrites,
-                topic=f"Purchase ticket for {weight_data['name']} | {interaction.user.id}",
+                topic=f"Ticket — {weight_name} | {interaction.user.id}",
             )
         except Exception as e:
-            await interaction.response.send_message(f"❌ Could not create ticket: {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Impossible de créer le ticket : {e}", ephemeral=True)
             return
 
-        # Embed dans le ticket
-        weight_name = weight_data.get("name", "Unknown")
-        price_display = weight_data.get("price_display", "")
+        # ── Message d'accueil personnalisé ──
+        welcome_template = weight_data.get("ticket_welcome_message", "").strip()
+        if welcome_template:
+            welcome_text = (
+                welcome_template
+                .replace("{user}", interaction.user.mention)
+                .replace("{weight}", weight_name)
+                .replace("{price}", price_display or "N/A")
+            )
+        else:
+            welcome_text = (
+                f"Bonjour {interaction.user.mention} ! 👋\n\n"
+                f"Tu as ouvert un ticket pour **{weight_name}**.\n"
+                f"{'**Prix :** ' + price_display + chr(10) if price_display else ''}"
+                f"\nUn membre du staff va t'aider très bientôt.\n\n"
+                f"*Tu peux aussi utiliser le bouton ci-dessous pour commander directement via Stripe.*"
+            )
 
         ticket_embed = discord.Embed(
-            title=f"🎫 Purchase Ticket — {weight_name}",
-            description=(
-                f"Hello {interaction.user.mention}! 👋\n\n"
-                f"You've opened a ticket to purchase **{weight_name}**.\n"
-                f"{'**Price:** ' + price_display + chr(10) if price_display else ''}"
-                f"\nA staff member will assist you shortly.\n\n"
-                f"*You can also use the button below to order directly via Stripe.*"
-            ),
+            title=f"🎫 {prefix.capitalize()} — {weight_name}",
+            description=welcome_text,
             color=0x5865F2,
         )
-        ticket_embed.set_footer(text=f"Ticket opened by {interaction.user} • {interaction.user.id}")
+        ticket_embed.set_footer(text=f"Ticket ouvert par {interaction.user} • {interaction.user.id}")
 
-        # Bouton de fermeture du ticket
+        # ── Mentions staff dans le ticket ──
+        staff_mention_str = " ".join(r.mention for r in staff_role_objects) if staff_role_objects else ""
+        open_content = f"{interaction.user.mention}"
+        if staff_mention_str:
+            open_content += f" {staff_mention_str}"
+
         close_view = TicketCloseView(interaction.user.id)
-        await ticket_channel.send(
-            content=f"{interaction.user.mention}",
-            embed=ticket_embed,
-            view=close_view,
-        )
+        await ticket_channel.send(content=open_content, embed=ticket_embed, view=close_view)
 
-        # Ping staff si configuré
+        # ── Notification staff ──
         if STAFF_CHANNEL_ID:
             staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
             if staff_channel:
                 await staff_channel.send(
-                    f"📬 New purchase ticket for **{weight_name}** by {interaction.user.mention} → {ticket_channel.mention}"
+                    f"📬 Nouveau ticket **{prefix}** pour **{weight_name}** "
+                    f"par {interaction.user.mention} → {ticket_channel.mention}"
                 )
 
         await interaction.response.send_message(
-            f"✅ Your ticket has been created: {ticket_channel.mention}", ephemeral=True
+            f"✅ Ton ticket a été créé : {ticket_channel.mention}", ephemeral=True
         )
 
     @discord.ui.button(label="💳 Order Weight", style=discord.ButtonStyle.success, custom_id="weight_order_placeholder")
@@ -686,17 +728,24 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
             "version": version,
             "author": author,
             "product_model": product_model,
-            # Specs vides par défaut (à remplir avec /weightspecs)
+            # Specs vides par défaut
             "specs_general": "",
             "specs_ae": "",
             "specs_win": "",
             "specs_ex": "",
+            # Config ticket vide par défaut
+            "ticket_name_prefix": "",
+            "ticket_category_id": "",
+            "ticket_welcome_message": "",
+            "ticket_staff_roles": "",
         }
 
         weights = load_weights()
-        # Conserver les specs existantes si on édite
+        # Conserver les specs et config ticket existantes si on édite
         if self.weight_id and self.weight_id in weights:
-            for key in ["specs_general", "specs_ae", "specs_win", "specs_ex"]:
+            for key in ["specs_general", "specs_ae", "specs_win", "specs_ex",
+                        "ticket_name_prefix", "ticket_category_id",
+                        "ticket_welcome_message", "ticket_staff_roles"]:
                 weight_data[key] = weights[self.weight_id].get(key, "")
 
         if not self.weight_id:
@@ -709,22 +758,18 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
         weights[weight_id] = weight_data
         save_weights(weights)
 
-        embed = build_weight_embed(weight_data)
-        view = WeightView(weight_id)
-
-        await interaction.response.send_message(
-            f"✅ Weight **{weight_data['name']}** saved! Preview:",
-            embed=embed,
-            view=view,
-            ephemeral=True,
+        # Enchaîner directement sur le modal Specs (étape 2/3)
+        await interaction.response.send_modal(
+            WeightSpecsModal(weight_id=weight_id, existing=weight_data, step=2)
         )
 
 
-class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
+class WeightSpecsModal(discord.ui.Modal, title="Étape 2/3 — Specs"):
 
-    def __init__(self, weight_id: str, existing: dict = None):
+    def __init__(self, weight_id: str, existing: dict = None, step: int = 1):
         super().__init__()
         self.weight_id = weight_id
+        self.step = step  # 1 = édition standalone, 2 = dans le flux création
 
         self.specs_general = discord.ui.TextInput(
             label="General specs",
@@ -776,10 +821,107 @@ class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
         weights[self.weight_id]["specs_ex"] = self.specs_ex.value.strip()
         save_weights(weights)
 
-        embed = build_specs_embed(weights[self.weight_id])
+        if self.step == 2:
+            # Flux création → enchaîner sur la config ticket (étape 3/3)
+            await interaction.response.send_modal(
+                WeightTicketConfigModal(weight_id=self.weight_id, existing=weights[self.weight_id])
+            )
+        else:
+            # Édition standalone → afficher le preview des specs
+            embed = build_specs_embed(weights[self.weight_id])
+            await interaction.response.send_message(
+                f"✅ Specs mises à jour pour **{weights[self.weight_id]['name']}** !",
+                embed=embed,
+                ephemeral=True,
+            )
+
+
+class WeightTicketConfigModal(discord.ui.Modal, title="Étape 3/3 — Config Ticket"):
+    """Modal pour configurer la création de ticket liée à ce weight."""
+
+    def __init__(self, weight_id: str, existing: dict = None):
+        super().__init__()
+        self.weight_id = weight_id
+
+        self.ticket_prefix = discord.ui.TextInput(
+            label="Préfixe du salon ticket",
+            max_length=50,
+            required=False,
+            placeholder="purchase / support / order (défaut: ticket)",
+            default=existing.get("ticket_name_prefix", "") if existing else "",
+        )
+        self.ticket_category = discord.ui.TextInput(
+            label="ID de catégorie Discord (optionnel)",
+            max_length=30,
+            required=False,
+            placeholder="Ex: 1234567890123456789 (laisser vide = défaut)",
+            default=existing.get("ticket_category_id", "") if existing else "",
+        )
+        self.ticket_welcome = discord.ui.TextInput(
+            label="Message d'accueil dans le ticket",
+            style=discord.TextStyle.paragraph,
+            max_length=800,
+            required=False,
+            placeholder=(
+                "Bonjour {user} ! 👋\n"
+                "Tu as ouvert un ticket pour **{weight}**.\n"
+                "Un staff va t'aider rapidement.\n"
+                "Variables dispo : {user} {weight} {price}"
+            ),
+            default=existing.get("ticket_welcome_message", "") if existing else "",
+        )
+        self.ticket_staff_roles = discord.ui.TextInput(
+            label="IDs rôles staff à mentionner (séparés par des virgules)",
+            max_length=300,
+            required=False,
+            placeholder="Ex: 111111111111111111, 222222222222222222",
+            default=existing.get("ticket_staff_roles", "") if existing else "",
+        )
+
+        self.add_item(self.ticket_prefix)
+        self.add_item(self.ticket_category)
+        self.add_item(self.ticket_welcome)
+        self.add_item(self.ticket_staff_roles)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        weights = load_weights()
+        if self.weight_id not in weights:
+            await interaction.response.send_message("❌ Weight introuvable.", ephemeral=True)
+            return
+
+        weights[self.weight_id]["ticket_name_prefix"] = self.ticket_prefix.value.strip() or "ticket"
+        weights[self.weight_id]["ticket_category_id"] = self.ticket_category.value.strip()
+        weights[self.weight_id]["ticket_welcome_message"] = self.ticket_welcome.value.strip()
+        weights[self.weight_id]["ticket_staff_roles"] = self.ticket_staff_roles.value.strip()
+        save_weights(weights)
+
+        weight_data = weights[self.weight_id]
+        embed = build_weight_embed(weight_data)
+        specs_embed = build_specs_embed(weight_data)
+        view = WeightView(self.weight_id)
+
+        # Résumé config ticket
+        prefix = weight_data["ticket_name_prefix"]
+        cat_id = weight_data["ticket_category_id"] or "défaut (TICKET_CATEGORY_ID)"
+        roles_raw = weight_data["ticket_staff_roles"]
+        roles_display = ", ".join(f"<@&{r.strip()}>" for r in roles_raw.split(",") if r.strip()) or "admins uniquement"
+
+        ticket_info = (
+            f"**Préfixe salon :** `{prefix}-<username>`\n"
+            f"**Catégorie :** `{cat_id}`\n"
+            f"**Rôles staff :** {roles_display}\n"
+            f"**Message d'accueil :** {'✅ Personnalisé' if weight_data['ticket_welcome_message'] else '⚠️ Par défaut'}"
+        )
+        summary_embed = discord.Embed(
+            title="✅ Weight créé avec succès !",
+            description=ticket_info,
+            color=0x57F287,
+        )
+        summary_embed.set_footer(text=f"ID: {self.weight_id} • Utilise /weight pour le poster")
+
         await interaction.response.send_message(
-            f"✅ Specs updated for **{weights[self.weight_id]['name']}**! Preview:",
-            embed=embed,
+            embeds=[embed, specs_embed, summary_embed],
+            view=view,
             ephemeral=True,
         )
 
@@ -843,6 +985,20 @@ async def weightspecs_cmd(interaction: discord.Interaction, weight_id: str):
         await interaction.response.send_message("❌ Weight not found.", ephemeral=True)
         return
     modal = WeightSpecsModal(weight_id=weight_id, existing=weight_data)
+    await interaction.response.send_modal(modal)
+
+
+@tree.command(name="weightticket", description="Éditer la configuration ticket d'un weight")
+@app_commands.describe(weight_id="Le weight dont tu veux modifier la config ticket")
+@app_commands.autocomplete(weight_id=weight_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def weightticket_cmd(interaction: discord.Interaction, weight_id: str):
+    weights = load_weights()
+    weight_data = weights.get(weight_id)
+    if not weight_data:
+        await interaction.response.send_message("❌ Weight introuvable.", ephemeral=True)
+        return
+    modal = WeightTicketConfigModal(weight_id=weight_id, existing=weight_data)
     await interaction.response.send_modal(modal)
 
 
