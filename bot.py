@@ -764,7 +764,7 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
         )
 
 
-class WeightSpecsModal(discord.ui.Modal, title="Étape 2/3 — Specs"):
+class WeightSpecsModal(discord.ui.Modal, title="Step 2/3 - Specs"):
 
     def __init__(self, weight_id: str, existing: dict = None, step: int = 1):
         super().__init__()
@@ -836,7 +836,7 @@ class WeightSpecsModal(discord.ui.Modal, title="Étape 2/3 — Specs"):
             )
 
 
-class WeightTicketConfigModal(discord.ui.Modal, title="Étape 3/3 — Config Ticket"):
+class WeightTicketConfigModal(discord.ui.Modal, title="Step 3/3 - Ticket Config"):
     """Modal pour configurer la création de ticket liée à ce weight."""
 
     def __init__(self, weight_id: str, existing: dict = None):
