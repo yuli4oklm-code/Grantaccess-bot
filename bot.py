@@ -12,6 +12,7 @@ import json
 import threading
 import time
 import re
+import uuid
 
 import stripe
 from flask import Flask, request, jsonify
@@ -2195,6 +2196,86 @@ async def vouch_cmd(interaction: discord.Interaction):
 # ─────────────────────────────────────────────
 
 flask_app = Flask(__name__)
+
+
+SITE_ORIGIN = os.environ.get("SITE_ORIGIN", "https://cubismael.com")
+SITE_SUCCESS_URL = os.environ.get("SITE_SUCCESS_URL", "https://cubismael.com/?payment=success")
+SITE_CANCEL_URL = os.environ.get("SITE_CANCEL_URL", "https://cubismael.com/?payment=cancel")
+
+SITE_PRODUCTS = {
+    "weight-valorant": {
+        "name": "Valorant Weight",
+        "model": "XyCubValorantV2",
+        "platform": "winsight",
+        "price_cents": 3000,
+    },
+    "weight-marvel-rivals": {
+        "name": "Marvel Rivals Weight",
+        "model": os.environ.get("MARVEL_RIVALS_MODEL", "MarvelRivals"),
+        "platform": "winsight",
+        "price_cents": 3000,
+    },
+}
+
+
+def site_checkout_response(payload, status=200):
+    response = jsonify(payload)
+    response.status_code = status
+    response.headers["Access-Control-Allow-Origin"] = SITE_ORIGIN
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return response
+
+
+@flask_app.route("/site-create-checkout", methods=["OPTIONS", "POST"])
+def site_create_checkout():
+    if request.method == "OPTIONS":
+        return site_checkout_response({})
+
+    data = request.get_json(force=True, silent=True) or {}
+    product_id = str(data.get("productId", "")).strip()
+    buyer_contact = str(data.get("buyerContact", "")).strip()
+    product = SITE_PRODUCTS.get(product_id)
+
+    if not product:
+        return site_checkout_response({"error": "Unknown product"}, 400)
+    if len(buyer_contact) < 3 or len(buyer_contact) > 120:
+        return site_checkout_response({"error": "Enter a valid Discord username or Winsight email"}, 400)
+
+    order_id = f"site_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+    checkout_session = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=[
+            {
+                "price_data": {
+                    "currency": "eur",
+                    "product_data": {"name": product["name"]},
+                    "unit_amount": product["price_cents"],
+                },
+                "quantity": 1,
+            }
+        ],
+        mode="payment",
+        success_url=SITE_SUCCESS_URL,
+        cancel_url=SITE_CANCEL_URL,
+        metadata={
+            "order_id": order_id,
+            "source": "website",
+            "product_id": product_id,
+        },
+    )
+
+    create_order(
+        order_id=order_id,
+        buyer_id=0,
+        buyer_contact=buyer_contact,
+        model=product["model"],
+        platform=product["platform"],
+        stripe_session_id=checkout_session.id,
+    )
+
+    return site_checkout_response({"url": checkout_session.url})
 
 
 @flask_app.route("/stripe-webhook", methods=["POST"])
