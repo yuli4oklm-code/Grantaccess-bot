@@ -1669,6 +1669,13 @@ async def process_paid_order(order_id: str):
 
     if platform == "enginex":
         success, message = await enginex_grant(order["buyer_contact"], order["model"])
+    elif platform == "winsight_dynamic":
+        nb_ok, nb_fail, details = await winsight_grant_all_dynamic(order["buyer_contact"], order["model"])
+        success = nb_ok > 0 and nb_fail == 0
+        message = (
+            f"Dynamic Winsight grant for keyword '{order['model']}': "
+            f"{nb_ok} added, {nb_fail} failed.\n" + "\n".join(details)
+        )
     else:
         success, message = await winsight_grant(order["buyer_contact"], order["model"])
 
@@ -2211,8 +2218,8 @@ SITE_PRODUCTS = {
     },
     "weight-marvel-rivals": {
         "name": "Marvel Rivals Weight",
-        "model": os.environ.get("MARVEL_RIVALS_MODEL", "MarvelRivals"),
-        "platform": "winsight",
+        "model": os.environ.get("MARVEL_RIVALS_KEYWORD", "Marvels"),
+        "platform": "winsight_dynamic",
         "price_cents": 3000,
     },
 }
