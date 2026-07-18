@@ -12,7 +12,6 @@ import json
 import threading
 import time
 import re
-import uuid
 
 import stripe
 from flask import Flask, request, jsonify
@@ -48,6 +47,7 @@ ORDERS_FILE = os.path.join(DATA_DIR, "winsight_orders.json")
 PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
 WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
+TICKET_PANELS_FILE = os.path.join(DATA_DIR, "ticket_panels.json")
 
 EMBED_COLOR = 0x2F3136
 CONFIG_BACKUP_MARKER = "WINSIGHT_BOT_CONFIG_BACKUP_V1"
@@ -173,6 +173,14 @@ def load_weights():
 
 def save_weights(data):
     save_json(WEIGHTS_FILE, data)
+
+
+def load_ticket_panels():
+    return load_json(TICKET_PANELS_FILE, {})
+
+
+def save_ticket_panels(data):
+    save_json(TICKET_PANELS_FILE, data)
 
 
 def create_order(order_id, buyer_id, buyer_contact, model, platform, stripe_session_id):
@@ -452,118 +460,76 @@ class WeightView(discord.ui.View):
             return
 
         guild = interaction.guild
-        weight_name = weight_data.get("name", "Unknown")
-        price_display = weight_data.get("price_display", "")
-
-        # ── Préfixe du salon ticket ──
-        prefix = weight_data.get("ticket_name_prefix", "").strip() or "ticket"
-        safe_username = interaction.user.name.lower().replace(' ', '-')
-        ticket_name = f"{prefix}-{safe_username}"
-
-        # ── Catégorie : priorité à celle du weight, sinon TICKET_CATEGORY_ID global ──
         category = None
-        custom_cat_id = weight_data.get("ticket_category_id", "").strip()
-        if custom_cat_id:
-            try:
-                category = guild.get_channel(int(custom_cat_id))
-            except ValueError:
-                pass
-        if category is None and TICKET_CATEGORY_ID:
+        if TICKET_CATEGORY_ID:
             category = guild.get_channel(TICKET_CATEGORY_ID)
 
-        # ── Vérifier ticket déjà ouvert ──
+        # Vérifier si l'utilisateur a déjà un ticket ouvert pour ce weight
+        ticket_name = f"ticket-{interaction.user.name.lower().replace(' ', '-')}"
         existing = discord.utils.get(guild.text_channels, name=ticket_name)
         if existing:
             await interaction.response.send_message(
-                f"❌ Tu as déjà un ticket ouvert : {existing.mention}", ephemeral=True
+                f"❌ You already have an open ticket: {existing.mention}", ephemeral=True
             )
             return
 
-        # ── Permissions de base ──
+        # Créer le salon ticket
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
         }
-
-        # Admins toujours inclus
+        # Donner accès aux admins
         for role in guild.roles:
             if role.permissions.administrator:
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
-        # Rôles staff personnalisés définis dans le weight
-        staff_roles_raw = weight_data.get("ticket_staff_roles", "").strip()
-        staff_role_objects = []
-        if staff_roles_raw:
-            for rid in staff_roles_raw.split(","):
-                rid = rid.strip()
-                if not rid:
-                    continue
-                try:
-                    role = guild.get_role(int(rid))
-                    if role:
-                        overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-                        staff_role_objects.append(role)
-                except ValueError:
-                    pass
-
-        # ── Créer le salon ──
         try:
             ticket_channel = await guild.create_text_channel(
                 name=ticket_name,
                 category=category,
                 overwrites=overwrites,
-                topic=f"Ticket — {weight_name} | {interaction.user.id}",
+                topic=f"Purchase ticket for {weight_data['name']} | {interaction.user.id}",
             )
         except Exception as e:
-            await interaction.response.send_message(f"❌ Impossible de créer le ticket : {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Could not create ticket: {e}", ephemeral=True)
             return
 
-        # ── Message d'accueil personnalisé ──
-        welcome_template = weight_data.get("ticket_welcome_message", "").strip()
-        if welcome_template:
-            welcome_text = (
-                welcome_template
-                .replace("{user}", interaction.user.mention)
-                .replace("{weight}", weight_name)
-                .replace("{price}", price_display or "N/A")
-            )
-        else:
-            welcome_text = (
-                f"Bonjour {interaction.user.mention} ! 👋\n\n"
-                f"Tu as ouvert un ticket pour **{weight_name}**.\n"
-                f"{'**Prix :** ' + price_display + chr(10) if price_display else ''}"
-                f"\nUn membre du staff va t'aider très bientôt.\n\n"
-                f"*Tu peux aussi utiliser le bouton ci-dessous pour commander directement via Stripe.*"
-            )
+        # Embed dans le ticket
+        weight_name = weight_data.get("name", "Unknown")
+        price_display = weight_data.get("price_display", "")
 
         ticket_embed = discord.Embed(
-            title=f"🎫 {prefix.capitalize()} — {weight_name}",
-            description=welcome_text,
+            title=f"🎫 Purchase Ticket — {weight_name}",
+            description=(
+                f"Hello {interaction.user.mention}! 👋\n\n"
+                f"You've opened a ticket to purchase **{weight_name}**.\n"
+                f"{'**Price:** ' + price_display + chr(10) if price_display else ''}"
+                f"\nA staff member will assist you shortly.\n\n"
+                f"*You can also use the button below to order directly via Stripe.*"
+            ),
             color=0x5865F2,
         )
-        ticket_embed.set_footer(text=f"Ticket ouvert par {interaction.user} • {interaction.user.id}")
+        ticket_embed.set_footer(text=f"Ticket opened by {interaction.user} • {interaction.user.id}")
 
-        # ── Mentions staff dans le ticket ──
-        staff_mention_str = " ".join(r.mention for r in staff_role_objects) if staff_role_objects else ""
-        open_content = f"{interaction.user.mention}"
-        if staff_mention_str:
-            open_content += f" {staff_mention_str}"
-
+        # Bouton de fermeture du ticket
         close_view = TicketCloseView(interaction.user.id)
-        await ticket_channel.send(content=open_content, embed=ticket_embed, view=close_view)
+        await ticket_channel.send(
+            content=f"{interaction.user.mention}",
+            embed=ticket_embed,
+            view=close_view,
+        )
 
-        # ── Notification staff ──
+        # Ping staff si configuré
         if STAFF_CHANNEL_ID:
             staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
             if staff_channel:
                 await staff_channel.send(
-                    f"📬 Nouveau ticket **{prefix}** pour **{weight_name}** "
-                    f"par {interaction.user.mention} → {ticket_channel.mention}"
+                    f"📬 New purchase ticket for **{weight_name}** by {interaction.user.mention} → {ticket_channel.mention}"
                 )
 
         await interaction.response.send_message(
-            f"✅ Ton ticket a été créé : {ticket_channel.mention}", ephemeral=True
+            f"✅ Your ticket has been created: {ticket_channel.mention}", ephemeral=True
         )
 
     @discord.ui.button(label="💳 Order Weight", style=discord.ButtonStyle.success, custom_id="weight_order_placeholder")
@@ -729,24 +695,17 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
             "version": version,
             "author": author,
             "product_model": product_model,
-            # Specs vides par défaut
+            # Specs vides par défaut (à remplir avec /weightspecs)
             "specs_general": "",
             "specs_ae": "",
             "specs_win": "",
             "specs_ex": "",
-            # Config ticket vide par défaut
-            "ticket_name_prefix": "",
-            "ticket_category_id": "",
-            "ticket_welcome_message": "",
-            "ticket_staff_roles": "",
         }
 
         weights = load_weights()
-        # Conserver les specs et config ticket existantes si on édite
+        # Conserver les specs existantes si on édite
         if self.weight_id and self.weight_id in weights:
-            for key in ["specs_general", "specs_ae", "specs_win", "specs_ex",
-                        "ticket_name_prefix", "ticket_category_id",
-                        "ticket_welcome_message", "ticket_staff_roles"]:
+            for key in ["specs_general", "specs_ae", "specs_win", "specs_ex"]:
                 weight_data[key] = weights[self.weight_id].get(key, "")
 
         if not self.weight_id:
@@ -759,18 +718,22 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
         weights[weight_id] = weight_data
         save_weights(weights)
 
-        # Enchaîner directement sur le modal Specs (étape 2/3)
-        await interaction.response.send_modal(
-            WeightSpecsModal(weight_id=weight_id, existing=weight_data, step=2)
+        embed = build_weight_embed(weight_data)
+        view = WeightView(weight_id)
+
+        await interaction.response.send_message(
+            f"✅ Weight **{weight_data['name']}** saved! Preview:",
+            embed=embed,
+            view=view,
+            ephemeral=True,
         )
 
 
-class WeightSpecsModal(discord.ui.Modal, title="Step 2/3 - Specs"):
+class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
 
-    def __init__(self, weight_id: str, existing: dict = None, step: int = 1):
+    def __init__(self, weight_id: str, existing: dict = None):
         super().__init__()
         self.weight_id = weight_id
-        self.step = step  # 1 = édition standalone, 2 = dans le flux création
 
         self.specs_general = discord.ui.TextInput(
             label="General specs",
@@ -822,107 +785,10 @@ class WeightSpecsModal(discord.ui.Modal, title="Step 2/3 - Specs"):
         weights[self.weight_id]["specs_ex"] = self.specs_ex.value.strip()
         save_weights(weights)
 
-        if self.step == 2:
-            # Flux création → enchaîner sur la config ticket (étape 3/3)
-            await interaction.response.send_modal(
-                WeightTicketConfigModal(weight_id=self.weight_id, existing=weights[self.weight_id])
-            )
-        else:
-            # Édition standalone → afficher le preview des specs
-            embed = build_specs_embed(weights[self.weight_id])
-            await interaction.response.send_message(
-                f"✅ Specs mises à jour pour **{weights[self.weight_id]['name']}** !",
-                embed=embed,
-                ephemeral=True,
-            )
-
-
-class WeightTicketConfigModal(discord.ui.Modal, title="Step 3/3 - Ticket Config"):
-    """Modal pour configurer la création de ticket liée à ce weight."""
-
-    def __init__(self, weight_id: str, existing: dict = None):
-        super().__init__()
-        self.weight_id = weight_id
-
-        self.ticket_prefix = discord.ui.TextInput(
-            label="Préfixe du salon ticket",
-            max_length=50,
-            required=False,
-            placeholder="purchase / support / order (défaut: ticket)",
-            default=existing.get("ticket_name_prefix", "") if existing else "",
-        )
-        self.ticket_category = discord.ui.TextInput(
-            label="ID de catégorie Discord (optionnel)",
-            max_length=30,
-            required=False,
-            placeholder="Ex: 1234567890123456789 (laisser vide = défaut)",
-            default=existing.get("ticket_category_id", "") if existing else "",
-        )
-        self.ticket_welcome = discord.ui.TextInput(
-            label="Message d'accueil dans le ticket",
-            style=discord.TextStyle.paragraph,
-            max_length=800,
-            required=False,
-            placeholder=(
-                "Bonjour {user} ! 👋\n"
-                "Tu as ouvert un ticket pour **{weight}**.\n"
-                "Un staff va t'aider rapidement.\n"
-                "Variables dispo : {user} {weight} {price}"
-            ),
-            default=existing.get("ticket_welcome_message", "") if existing else "",
-        )
-        self.ticket_staff_roles = discord.ui.TextInput(
-            label="IDs rôles staff à mentionner (séparés par des virgules)",
-            max_length=300,
-            required=False,
-            placeholder="Ex: 111111111111111111, 222222222222222222",
-            default=existing.get("ticket_staff_roles", "") if existing else "",
-        )
-
-        self.add_item(self.ticket_prefix)
-        self.add_item(self.ticket_category)
-        self.add_item(self.ticket_welcome)
-        self.add_item(self.ticket_staff_roles)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        weights = load_weights()
-        if self.weight_id not in weights:
-            await interaction.response.send_message("❌ Weight introuvable.", ephemeral=True)
-            return
-
-        weights[self.weight_id]["ticket_name_prefix"] = self.ticket_prefix.value.strip() or "ticket"
-        weights[self.weight_id]["ticket_category_id"] = self.ticket_category.value.strip()
-        weights[self.weight_id]["ticket_welcome_message"] = self.ticket_welcome.value.strip()
-        weights[self.weight_id]["ticket_staff_roles"] = self.ticket_staff_roles.value.strip()
-        save_weights(weights)
-
-        weight_data = weights[self.weight_id]
-        embed = build_weight_embed(weight_data)
-        specs_embed = build_specs_embed(weight_data)
-        view = WeightView(self.weight_id)
-
-        # Résumé config ticket
-        prefix = weight_data["ticket_name_prefix"]
-        cat_id = weight_data["ticket_category_id"] or "défaut (TICKET_CATEGORY_ID)"
-        roles_raw = weight_data["ticket_staff_roles"]
-        roles_display = ", ".join(f"<@&{r.strip()}>" for r in roles_raw.split(",") if r.strip()) or "admins uniquement"
-
-        ticket_info = (
-            f"**Préfixe salon :** `{prefix}-<username>`\n"
-            f"**Catégorie :** `{cat_id}`\n"
-            f"**Rôles staff :** {roles_display}\n"
-            f"**Message d'accueil :** {'✅ Personnalisé' if weight_data['ticket_welcome_message'] else '⚠️ Par défaut'}"
-        )
-        summary_embed = discord.Embed(
-            title="✅ Weight créé avec succès !",
-            description=ticket_info,
-            color=0x57F287,
-        )
-        summary_embed.set_footer(text=f"ID: {self.weight_id} • Utilise /weight pour le poster")
-
+        embed = build_specs_embed(weights[self.weight_id])
         await interaction.response.send_message(
-            embeds=[embed, specs_embed, summary_embed],
-            view=view,
+            f"✅ Specs updated for **{weights[self.weight_id]['name']}**! Preview:",
+            embed=embed,
             ephemeral=True,
         )
 
@@ -989,20 +855,6 @@ async def weightspecs_cmd(interaction: discord.Interaction, weight_id: str):
     await interaction.response.send_modal(modal)
 
 
-@tree.command(name="weightticket", description="Éditer la configuration ticket d'un weight")
-@app_commands.describe(weight_id="Le weight dont tu veux modifier la config ticket")
-@app_commands.autocomplete(weight_id=weight_autocomplete)
-@app_commands.checks.has_permissions(administrator=True)
-async def weightticket_cmd(interaction: discord.Interaction, weight_id: str):
-    weights = load_weights()
-    weight_data = weights.get(weight_id)
-    if not weight_data:
-        await interaction.response.send_message("❌ Weight introuvable.", ephemeral=True)
-        return
-    modal = WeightTicketConfigModal(weight_id=weight_id, existing=weight_data)
-    await interaction.response.send_modal(modal)
-
-
 @tree.command(name="weightdelete", description="Supprimer un weight")
 @app_commands.describe(weight_id="Le weight à supprimer")
 @app_commands.autocomplete(weight_id=weight_autocomplete)
@@ -1032,6 +884,429 @@ async def weightlist_cmd(interaction: discord.Interaction):
         embed.add_field(
             name=w["name"],
             value=f"ID: `{wid}`\nPlatforms: {platforms or 'N/A'}\nPrice: {w.get('price_display', 'N/A')}",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  TICKET PANEL SYSTEM (customizable)
+# ─────────────────────────────────────────────
+
+BUTTON_STYLES_MAP = {
+    "primary": discord.ButtonStyle.primary,
+    "secondary": discord.ButtonStyle.secondary,
+    "success": discord.ButtonStyle.success,
+    "danger": discord.ButtonStyle.danger,
+}
+
+
+class TicketPanelView(discord.ui.View):
+
+    def __init__(self, panel_id: str):
+        super().__init__(timeout=None)
+        self.panel_id = panel_id
+        panels = load_ticket_panels()
+        panel = panels.get(panel_id, {})
+        self.children[0].custom_id = f"tpanel_{panel_id}"
+        emoji = panel.get("button_emoji", "\U0001f3ab")
+        label = panel.get("button_label", "Open Ticket")
+        self.children[0].label = f"{emoji} {label}" if emoji else label
+        style_name = panel.get("button_style", "primary")
+        self.children[0].style = BUTTON_STYLES_MAP.get(style_name, discord.ButtonStyle.primary)
+
+    @discord.ui.button(label="\U0001f3ab Open Ticket", style=discord.ButtonStyle.primary, custom_id="tpanel_placeholder")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        panel_id = button.custom_id.replace("tpanel_", "")
+        panels = load_ticket_panels()
+        panel = panels.get(panel_id)
+        if not panel:
+            await interaction.response.send_message("❌ This ticket panel no longer exists.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        max_tickets = panel.get("max_tickets", 1)
+
+        if max_tickets > 0:
+            count = sum(
+                1 for ch in guild.text_channels
+                if ch.topic and f"tpanel:{panel_id}" in ch.topic and f"tuser:{interaction.user.id}" in ch.topic
+            )
+            if count >= max_tickets:
+                await interaction.response.send_message(
+                    f"❌ You already have {count} open ticket(s) for this panel (max {max_tickets}).",
+                    ephemeral=True,
+                )
+                return
+
+        fmt = panel.get("channel_format", "ticket-{user}")
+        ch_name = fmt.replace("{user}", interaction.user.name.lower().replace(" ", "-"))
+        ch_name = ch_name.replace("{id}", str(interaction.user.id))
+        ch_name = ch_name.replace("{panel}", panel_id.replace("_", "-"))
+        ch_name = re.sub(r'[^a-z0-9\-]', '-', ch_name.lower())[:100]
+
+        category = None
+        cat_id = panel.get("category_id")
+        if cat_id:
+            category = guild.get_channel(int(cat_id))
+        elif TICKET_CATEGORY_ID:
+            category = guild.get_channel(TICKET_CATEGORY_ID)
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        }
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        for rid in panel.get("ping_roles", []):
+            role = guild.get_role(int(rid))
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=ch_name,
+                category=category,
+                overwrites=overwrites,
+                topic=f"tpanel:{panel_id} | tuser:{interaction.user.id} | {panel.get('title', 'Ticket')}",
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Could not create ticket: {e}", ephemeral=True)
+            return
+
+        color_hex = panel.get("embed_color", "5865F2")
+        try:
+            color = int(color_hex, 16)
+        except ValueError:
+            color = 0x5865F2
+
+        welcome_embed = discord.Embed(
+            title=panel.get("welcome_title", f"\U0001f3ab {panel.get('title', 'Ticket')}"),
+            description=f"{interaction.user.mention}\n\n{panel.get('welcome_message', 'A staff member will assist you shortly.')}",
+            color=color,
+        )
+        welcome_embed.set_footer(text=f"Ticket by {interaction.user} • {interaction.user.id}")
+
+        ping_parts = [interaction.user.mention]
+        for rid in panel.get("ping_roles", []):
+            ping_parts.append(f"<@&{rid}>")
+
+        await ticket_channel.send(
+            content=" ".join(ping_parts),
+            embed=welcome_embed,
+            view=TicketActionsView(),
+        )
+
+        log_cid = panel.get("log_channel_id") or STAFF_CHANNEL_ID
+        if log_cid:
+            log_ch = bot.get_channel(int(log_cid))
+            if log_ch:
+                await log_ch.send(
+                    f"\U0001f4ec New **{panel.get('title', 'Ticket')}** ticket by {interaction.user.mention} → {ticket_channel.mention}"
+                )
+
+        await interaction.response.send_message(
+            f"✅ Ticket created: {ticket_channel.mention}", ephemeral=True
+        )
+
+
+class TicketActionsView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="\U0001f512 Close", style=discord.ButtonStyle.danger, custom_id="ticket_v2_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        is_admin = interaction.user.guild_permissions.administrator
+        topic = interaction.channel.topic or ""
+        owner_match = re.search(r'tuser:(\d+)', topic)
+        is_owner = owner_match and interaction.user.id == int(owner_match.group(1))
+
+        if not is_admin and not is_owner:
+            await interaction.response.send_message("❌ You can't close this ticket.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("\U0001f512 Closing ticket in 5 seconds...")
+
+        log_cid = STAFF_CHANNEL_ID
+        panel_match = re.search(r'tpanel:(\S+)', topic)
+        if panel_match:
+            panels = load_ticket_panels()
+            panel = panels.get(panel_match.group(1), {})
+            log_cid = panel.get("log_channel_id") or STAFF_CHANNEL_ID
+
+        if log_cid:
+            log_ch = bot.get_channel(int(log_cid))
+            if log_ch:
+                embed = discord.Embed(
+                    title="\U0001f512 Ticket Closed",
+                    description=f"**Channel:** #{interaction.channel.name}\n**Closed by:** {interaction.user.mention}",
+                    color=0xED4245,
+                )
+                if owner_match:
+                    embed.add_field(name="Owner", value=f"<@{owner_match.group(1)}>", inline=True)
+                await log_ch.send(embed=embed)
+
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except Exception as e:
+            print(f"[Ticket] Could not delete channel: {e}")
+
+    @discord.ui.button(label="\U0001f64b Claim", style=discord.ButtonStyle.secondary, custom_id="ticket_v2_claim")
+    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_channels:
+            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return
+
+        topic = interaction.channel.topic or ""
+        if f"claimed:{interaction.user.id}" in topic:
+            await interaction.response.send_message("You already claimed this ticket.", ephemeral=True)
+            return
+
+        new_topic = topic + f" | claimed:{interaction.user.id}"
+        await interaction.channel.edit(topic=new_topic)
+        await interaction.response.send_message(f"\U0001f64b {interaction.user.mention} claimed this ticket.")
+
+
+class TicketPanelModal(discord.ui.Modal, title="Create / Edit Ticket Panel"):
+
+    def __init__(self, panel_id: str = None, existing: dict = None):
+        super().__init__()
+        self.panel_id = panel_id
+
+        extra_default = ""
+        if existing:
+            parts = []
+            if existing.get("category_id"):
+                parts.append(f"category: {existing['category_id']}")
+            if existing.get("embed_color", "5865F2") != "5865F2":
+                parts.append(f"color: {existing['embed_color']}")
+            if existing.get("button_style", "primary") != "primary":
+                parts.append(f"style: {existing['button_style']}")
+            if existing.get("button_emoji", "\U0001f3ab") != "\U0001f3ab":
+                parts.append(f"emoji: {existing['button_emoji']}")
+            if existing.get("welcome_title"):
+                parts.append(f"welcome_title: {existing['welcome_title']}")
+            if existing.get("welcome_message") and existing["welcome_message"] != "A staff member will assist you shortly.":
+                parts.append(f"welcome: {existing['welcome_message']}")
+            if existing.get("ping_roles"):
+                parts.append(f"ping: {','.join(str(r) for r in existing['ping_roles'])}")
+            if existing.get("max_tickets", 1) != 1:
+                parts.append(f"max: {existing['max_tickets']}")
+            if existing.get("log_channel_id"):
+                parts.append(f"log: {existing['log_channel_id']}")
+            extra_default = "\n".join(parts)
+
+        self.title_input = discord.ui.TextInput(
+            label="Panel title",
+            max_length=100,
+            required=True,
+            placeholder="Support",
+            default=existing.get("title", "") if existing else "",
+        )
+        self.desc_input = discord.ui.TextInput(
+            label="Panel description",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=True,
+            placeholder="Click below to open a support ticket.",
+            default=existing.get("description", "") if existing else "",
+        )
+        self.button_input = discord.ui.TextInput(
+            label="Button label",
+            max_length=80,
+            required=False,
+            placeholder="Open Ticket",
+            default=existing.get("button_label", "") if existing else "",
+        )
+        self.channel_input = discord.ui.TextInput(
+            label="Channel name format ({user} {id} {panel})",
+            max_length=100,
+            required=False,
+            placeholder="ticket-{user}",
+            default=existing.get("channel_format", "") if existing else "",
+        )
+        self.extra_input = discord.ui.TextInput(
+            label="Extra settings (one per line)",
+            style=discord.TextStyle.paragraph,
+            max_length=800,
+            required=False,
+            placeholder="category: ID\ncolor: 5865F2\nstyle: primary\nemoji: \U0001f3ab\nwelcome: ...\nping: role_id\nmax: 1\nlog: channel_id",
+            default=extra_default,
+        )
+
+        self.add_item(self.title_input)
+        self.add_item(self.desc_input)
+        self.add_item(self.button_input)
+        self.add_item(self.channel_input)
+        self.add_item(self.extra_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        category_id = None
+        embed_color = "5865F2"
+        button_style = "primary"
+        button_emoji = "\U0001f3ab"
+        welcome_message = "A staff member will assist you shortly."
+        welcome_title = ""
+        ping_roles = []
+        max_tickets = 1
+        log_channel_id = None
+
+        for line in self.extra_input.value.strip().splitlines():
+            line = line.strip()
+            low = line.lower()
+            if low.startswith("category:"):
+                category_id = line.split(":", 1)[1].strip()
+            elif low.startswith("color:"):
+                embed_color = line.split(":", 1)[1].strip().lstrip("#")
+            elif low.startswith("style:"):
+                button_style = line.split(":", 1)[1].strip().lower()
+            elif low.startswith("emoji:"):
+                button_emoji = line.split(":", 1)[1].strip()
+            elif low.startswith("welcome_title:"):
+                welcome_title = line.split(":", 1)[1].strip()
+            elif low.startswith("welcome:"):
+                welcome_message = line.split(":", 1)[1].strip()
+            elif low.startswith("ping:"):
+                raw = line.split(":", 1)[1].strip()
+                ping_roles = [r.strip() for r in raw.split(",") if r.strip()]
+            elif low.startswith("max:"):
+                try:
+                    max_tickets = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif low.startswith("log:"):
+                log_channel_id = line.split(":", 1)[1].strip()
+
+        panel_title = self.title_input.value.strip()
+
+        panel_data = {
+            "title": panel_title,
+            "description": self.desc_input.value.strip(),
+            "button_label": self.button_input.value.strip() or "Open Ticket",
+            "button_emoji": button_emoji,
+            "button_style": button_style if button_style in BUTTON_STYLES_MAP else "primary",
+            "channel_format": self.channel_input.value.strip() or "ticket-{user}",
+            "category_id": category_id,
+            "embed_color": embed_color,
+            "welcome_title": welcome_title or f"\U0001f3ab {panel_title}",
+            "welcome_message": welcome_message,
+            "ping_roles": ping_roles,
+            "max_tickets": max_tickets,
+            "log_channel_id": log_channel_id,
+        }
+
+        panels = load_ticket_panels()
+        if not self.panel_id:
+            panel_id = re.sub(r'[^a-z0-9_]', '_', panel_title.lower())
+            if panel_id in panels:
+                panel_id = f"{panel_id}_{int(time.time())}"
+        else:
+            panel_id = self.panel_id
+
+        panels[panel_id] = panel_data
+        save_ticket_panels(panels)
+        bot.add_view(TicketPanelView(panel_id))
+
+        try:
+            color = int(embed_color, 16)
+        except ValueError:
+            color = 0x5865F2
+
+        embed = discord.Embed(title=panel_title, description=panel_data["description"], color=color)
+        embed.set_footer(text=f"Panel ID: {panel_id}")
+
+        await interaction.response.send_message(
+            f"✅ Panel **{panel_title}** saved (`{panel_id}`). Use `/ticketpost` to post it.",
+            embed=embed,
+            ephemeral=True,
+        )
+
+
+async def panel_autocomplete(interaction: discord.Interaction, current: str):
+    panels = load_ticket_panels()
+    matches = [
+        (pid, p["title"]) for pid, p in panels.items()
+        if current.lower() in p["title"].lower() or current.lower() in pid.lower()
+    ]
+    return [app_commands.Choice(name=title, value=pid) for pid, title in matches[:25]]
+
+
+@tree.command(name="ticketcreate", description="Create or edit a ticket panel")
+@app_commands.describe(panel_id="Leave empty to create new, or choose an existing panel to edit")
+@app_commands.autocomplete(panel_id=panel_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def ticketcreate_cmd(interaction: discord.Interaction, panel_id: str = None):
+    existing = None
+    if panel_id:
+        panels = load_ticket_panels()
+        existing = panels.get(panel_id)
+        if not existing:
+            await interaction.response.send_message("❌ Panel not found.", ephemeral=True)
+            return
+    modal = TicketPanelModal(panel_id=panel_id, existing=existing)
+    await interaction.response.send_modal(modal)
+
+
+@tree.command(name="ticketpost", description="Post a ticket panel in the current channel")
+@app_commands.describe(panel_id="The panel to post")
+@app_commands.autocomplete(panel_id=panel_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def ticketpost_cmd(interaction: discord.Interaction, panel_id: str):
+    panels = load_ticket_panels()
+    panel = panels.get(panel_id)
+    if not panel:
+        await interaction.response.send_message("❌ Panel not found.", ephemeral=True)
+        return
+
+    try:
+        color = int(panel.get("embed_color", "5865F2"), 16)
+    except ValueError:
+        color = 0x5865F2
+
+    embed = discord.Embed(title=panel["title"], description=panel["description"], color=color)
+    view = TicketPanelView(panel_id)
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
+
+
+@tree.command(name="ticketdelete", description="Delete a ticket panel")
+@app_commands.describe(panel_id="The panel to delete")
+@app_commands.autocomplete(panel_id=panel_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def ticketdelete_cmd(interaction: discord.Interaction, panel_id: str):
+    panels = load_ticket_panels()
+    if panel_id not in panels:
+        await interaction.response.send_message("❌ Panel not found.", ephemeral=True)
+        return
+    name = panels[panel_id]["title"]
+    del panels[panel_id]
+    save_ticket_panels(panels)
+    await interaction.response.send_message(f"\U0001f5d1️ Panel **{name}** deleted.", ephemeral=True)
+
+
+@tree.command(name="ticketlist", description="List all ticket panels")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticketlist_cmd(interaction: discord.Interaction):
+    panels = load_ticket_panels()
+    if not panels:
+        await interaction.response.send_message("No ticket panels configured.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="\U0001f3ab Ticket Panels", color=EMBED_COLOR)
+    for pid, p in panels.items():
+        cat_info = f"Category: <#{p['category_id']}>" if p.get("category_id") else "Default category"
+        embed.add_field(
+            name=p["title"],
+            value=(
+                f"ID: `{pid}`\n"
+                f"Channel: `{p.get('channel_format', 'ticket-{user}')}`\n"
+                f"Max tickets: {p.get('max_tickets', 1)}\n"
+                f"{cat_info}"
+            ),
             inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1209,6 +1484,12 @@ async def on_ready():
     weights = load_weights()
     for weight_id in weights:
         bot.add_view(WeightView(weight_id))
+
+    # Ré-enregistrer les TicketPanelViews + TicketActionsView
+    bot.add_view(TicketActionsView())
+    ticket_panels = load_ticket_panels()
+    for pid in ticket_panels:
+        bot.add_view(TicketPanelView(pid))
 
     print(f"✅ Bot connecté en tant que {bot.user} (ID: {bot.user.id})")
 
@@ -1669,13 +1950,6 @@ async def process_paid_order(order_id: str):
 
     if platform == "enginex":
         success, message = await enginex_grant(order["buyer_contact"], order["model"])
-    elif platform == "winsight_dynamic":
-        nb_ok, nb_fail, details = await winsight_grant_all_dynamic(order["buyer_contact"], order["model"])
-        success = nb_ok > 0 and nb_fail == 0
-        message = (
-            f"Dynamic Winsight grant for keyword '{order['model']}': "
-            f"{nb_ok} added, {nb_fail} failed.\n" + "\n".join(details)
-        )
     else:
         success, message = await winsight_grant(order["buyer_contact"], order["model"])
 
@@ -2203,86 +2477,6 @@ async def vouch_cmd(interaction: discord.Interaction):
 # ─────────────────────────────────────────────
 
 flask_app = Flask(__name__)
-
-
-SITE_ORIGIN = os.environ.get("SITE_ORIGIN", "https://cubismael.com")
-SITE_SUCCESS_URL = os.environ.get("SITE_SUCCESS_URL", "https://cubismael.com/?payment=success")
-SITE_CANCEL_URL = os.environ.get("SITE_CANCEL_URL", "https://cubismael.com/?payment=cancel")
-
-SITE_PRODUCTS = {
-    "weight-valorant": {
-        "name": "Valorant Weight",
-        "model": "XyCubValorantV2",
-        "platform": "winsight",
-        "price_cents": 3000,
-    },
-    "weight-marvel-rivals": {
-        "name": "Marvel Rivals Weight",
-        "model": os.environ.get("MARVEL_RIVALS_KEYWORD", "Marvels"),
-        "platform": "winsight_dynamic",
-        "price_cents": 3000,
-    },
-}
-
-
-def site_checkout_response(payload, status=200):
-    response = jsonify(payload)
-    response.status_code = status
-    response.headers["Access-Control-Allow-Origin"] = SITE_ORIGIN
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    return response
-
-
-@flask_app.route("/site-create-checkout", methods=["OPTIONS", "POST"])
-def site_create_checkout():
-    if request.method == "OPTIONS":
-        return site_checkout_response({})
-
-    data = request.get_json(force=True, silent=True) or {}
-    product_id = str(data.get("productId", "")).strip()
-    buyer_contact = str(data.get("buyerContact", "")).strip()
-    product = SITE_PRODUCTS.get(product_id)
-
-    if not product:
-        return site_checkout_response({"error": "Unknown product"}, 400)
-    if len(buyer_contact) < 3 or len(buyer_contact) > 120:
-        return site_checkout_response({"error": "Enter a valid Discord username or Winsight email"}, 400)
-
-    order_id = f"site_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-
-    checkout_session = stripe.checkout.Session.create(
-        payment_method_types=["card"],
-        line_items=[
-            {
-                "price_data": {
-                    "currency": "eur",
-                    "product_data": {"name": product["name"]},
-                    "unit_amount": product["price_cents"],
-                },
-                "quantity": 1,
-            }
-        ],
-        mode="payment",
-        success_url=SITE_SUCCESS_URL,
-        cancel_url=SITE_CANCEL_URL,
-        metadata={
-            "order_id": order_id,
-            "source": "website",
-            "product_id": product_id,
-        },
-    )
-
-    create_order(
-        order_id=order_id,
-        buyer_id=0,
-        buyer_contact=buyer_contact,
-        model=product["model"],
-        platform=product["platform"],
-        stripe_session_id=checkout_session.id,
-    )
-
-    return site_checkout_response({"url": checkout_session.url})
 
 
 @flask_app.route("/stripe-webhook", methods=["POST"])
