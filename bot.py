@@ -16,6 +16,7 @@ import re
 import stripe
 from flask import Flask, request, jsonify
 from playwright.async_api import async_playwright
+import aiohttp
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION
@@ -36,6 +37,10 @@ ENGINEX_PASSWORD = os.environ.get("ENGINEX_PASSWORD", "")
 ENGINEX_LOGIN_URL = os.environ.get("ENGINEX_LOGIN_URL", "https://enginex-ex.com/auth/signin")
 ENGINEX_ENTITLEMENTS_URL = os.environ.get("ENGINEX_ENTITLEMENTS_URL", "https://enginex-ex.com/entitlements")
 
+HELIOS_API_KEY = os.environ.get("HELIOS_API_KEY", "")
+HELIOS_RESOURCE_ID = os.environ.get("HELIOS_RESOURCE_ID", "6cabf1d2-8887-4b36-885d-e888b82f7987")
+HELIOS_API_URL = os.environ.get("HELIOS_API_URL", "https://helios.inputsense.com/api/v1")
+
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
 ORDER_PANEL_CHANNEL_ID = int(os.environ.get("ORDER_PANEL_CHANNEL_ID", "0")) or None
 VOUCH_CHANNEL_ID = int(os.environ.get("VOUCH_CHANNEL_ID", "0")) or None
@@ -47,7 +52,6 @@ ORDERS_FILE = os.path.join(DATA_DIR, "winsight_orders.json")
 PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
 WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
-TICKET_PANELS_FILE = os.path.join(DATA_DIR, "ticket_panels.json")
 
 EMBED_COLOR = 0x2F3136
 CONFIG_BACKUP_MARKER = "WINSIGHT_BOT_CONFIG_BACKUP_V1"
@@ -173,14 +177,6 @@ def load_weights():
 
 def save_weights(data):
     save_json(WEIGHTS_FILE, data)
-
-
-def load_ticket_panels():
-    return load_json(TICKET_PANELS_FILE, {})
-
-
-def save_ticket_panels(data):
-    save_json(TICKET_PANELS_FILE, data)
 
 
 def create_order(order_id, buyer_id, buyer_contact, model, platform, stripe_session_id):
@@ -890,429 +886,6 @@ async def weightlist_cmd(interaction: discord.Interaction):
 
 
 # ─────────────────────────────────────────────
-#  TICKET PANEL SYSTEM (customizable)
-# ─────────────────────────────────────────────
-
-BUTTON_STYLES_MAP = {
-    "primary": discord.ButtonStyle.primary,
-    "secondary": discord.ButtonStyle.secondary,
-    "success": discord.ButtonStyle.success,
-    "danger": discord.ButtonStyle.danger,
-}
-
-
-class TicketPanelView(discord.ui.View):
-
-    def __init__(self, panel_id: str):
-        super().__init__(timeout=None)
-        self.panel_id = panel_id
-        panels = load_ticket_panels()
-        panel = panels.get(panel_id, {})
-        self.children[0].custom_id = f"tpanel_{panel_id}"
-        emoji = panel.get("button_emoji", "\U0001f3ab")
-        label = panel.get("button_label", "Open Ticket")
-        self.children[0].label = f"{emoji} {label}" if emoji else label
-        style_name = panel.get("button_style", "primary")
-        self.children[0].style = BUTTON_STYLES_MAP.get(style_name, discord.ButtonStyle.primary)
-
-    @discord.ui.button(label="\U0001f3ab Open Ticket", style=discord.ButtonStyle.primary, custom_id="tpanel_placeholder")
-    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        panel_id = button.custom_id.replace("tpanel_", "")
-        panels = load_ticket_panels()
-        panel = panels.get(panel_id)
-        if not panel:
-            await interaction.response.send_message("❌ This ticket panel no longer exists.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        max_tickets = panel.get("max_tickets", 1)
-
-        if max_tickets > 0:
-            count = sum(
-                1 for ch in guild.text_channels
-                if ch.topic and f"tpanel:{panel_id}" in ch.topic and f"tuser:{interaction.user.id}" in ch.topic
-            )
-            if count >= max_tickets:
-                await interaction.response.send_message(
-                    f"❌ You already have {count} open ticket(s) for this panel (max {max_tickets}).",
-                    ephemeral=True,
-                )
-                return
-
-        fmt = panel.get("channel_format", "ticket-{user}")
-        ch_name = fmt.replace("{user}", interaction.user.name.lower().replace(" ", "-"))
-        ch_name = ch_name.replace("{id}", str(interaction.user.id))
-        ch_name = ch_name.replace("{panel}", panel_id.replace("_", "-"))
-        ch_name = re.sub(r'[^a-z0-9\-]', '-', ch_name.lower())[:100]
-
-        category = None
-        cat_id = panel.get("category_id")
-        if cat_id:
-            category = guild.get_channel(int(cat_id))
-        elif TICKET_CATEGORY_ID:
-            category = guild.get_channel(TICKET_CATEGORY_ID)
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-        }
-        for role in guild.roles:
-            if role.permissions.administrator:
-                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-        for rid in panel.get("ping_roles", []):
-            role = guild.get_role(int(rid))
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-        try:
-            ticket_channel = await guild.create_text_channel(
-                name=ch_name,
-                category=category,
-                overwrites=overwrites,
-                topic=f"tpanel:{panel_id} | tuser:{interaction.user.id} | {panel.get('title', 'Ticket')}",
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Could not create ticket: {e}", ephemeral=True)
-            return
-
-        color_hex = panel.get("embed_color", "5865F2")
-        try:
-            color = int(color_hex, 16)
-        except ValueError:
-            color = 0x5865F2
-
-        welcome_embed = discord.Embed(
-            title=panel.get("welcome_title", f"\U0001f3ab {panel.get('title', 'Ticket')}"),
-            description=f"{interaction.user.mention}\n\n{panel.get('welcome_message', 'A staff member will assist you shortly.')}",
-            color=color,
-        )
-        welcome_embed.set_footer(text=f"Ticket by {interaction.user} • {interaction.user.id}")
-
-        ping_parts = [interaction.user.mention]
-        for rid in panel.get("ping_roles", []):
-            ping_parts.append(f"<@&{rid}>")
-
-        await ticket_channel.send(
-            content=" ".join(ping_parts),
-            embed=welcome_embed,
-            view=TicketActionsView(),
-        )
-
-        log_cid = panel.get("log_channel_id") or STAFF_CHANNEL_ID
-        if log_cid:
-            log_ch = bot.get_channel(int(log_cid))
-            if log_ch:
-                await log_ch.send(
-                    f"\U0001f4ec New **{panel.get('title', 'Ticket')}** ticket by {interaction.user.mention} → {ticket_channel.mention}"
-                )
-
-        await interaction.response.send_message(
-            f"✅ Ticket created: {ticket_channel.mention}", ephemeral=True
-        )
-
-
-class TicketActionsView(discord.ui.View):
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="\U0001f512 Close", style=discord.ButtonStyle.danger, custom_id="ticket_v2_close")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        is_admin = interaction.user.guild_permissions.administrator
-        topic = interaction.channel.topic or ""
-        owner_match = re.search(r'tuser:(\d+)', topic)
-        is_owner = owner_match and interaction.user.id == int(owner_match.group(1))
-
-        if not is_admin and not is_owner:
-            await interaction.response.send_message("❌ You can't close this ticket.", ephemeral=True)
-            return
-
-        await interaction.response.send_message("\U0001f512 Closing ticket in 5 seconds...")
-
-        log_cid = STAFF_CHANNEL_ID
-        panel_match = re.search(r'tpanel:(\S+)', topic)
-        if panel_match:
-            panels = load_ticket_panels()
-            panel = panels.get(panel_match.group(1), {})
-            log_cid = panel.get("log_channel_id") or STAFF_CHANNEL_ID
-
-        if log_cid:
-            log_ch = bot.get_channel(int(log_cid))
-            if log_ch:
-                embed = discord.Embed(
-                    title="\U0001f512 Ticket Closed",
-                    description=f"**Channel:** #{interaction.channel.name}\n**Closed by:** {interaction.user.mention}",
-                    color=0xED4245,
-                )
-                if owner_match:
-                    embed.add_field(name="Owner", value=f"<@{owner_match.group(1)}>", inline=True)
-                await log_ch.send(embed=embed)
-
-        await asyncio.sleep(5)
-        try:
-            await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}")
-        except Exception as e:
-            print(f"[Ticket] Could not delete channel: {e}")
-
-    @discord.ui.button(label="\U0001f64b Claim", style=discord.ButtonStyle.secondary, custom_id="ticket_v2_claim")
-    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.manage_channels:
-            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-            return
-
-        topic = interaction.channel.topic or ""
-        if f"claimed:{interaction.user.id}" in topic:
-            await interaction.response.send_message("You already claimed this ticket.", ephemeral=True)
-            return
-
-        new_topic = topic + f" | claimed:{interaction.user.id}"
-        await interaction.channel.edit(topic=new_topic)
-        await interaction.response.send_message(f"\U0001f64b {interaction.user.mention} claimed this ticket.")
-
-
-class TicketPanelModal(discord.ui.Modal, title="Create / Edit Ticket Panel"):
-
-    def __init__(self, panel_id: str = None, existing: dict = None):
-        super().__init__()
-        self.panel_id = panel_id
-
-        extra_default = ""
-        if existing:
-            parts = []
-            if existing.get("category_id"):
-                parts.append(f"category: {existing['category_id']}")
-            if existing.get("embed_color", "5865F2") != "5865F2":
-                parts.append(f"color: {existing['embed_color']}")
-            if existing.get("button_style", "primary") != "primary":
-                parts.append(f"style: {existing['button_style']}")
-            if existing.get("button_emoji", "\U0001f3ab") != "\U0001f3ab":
-                parts.append(f"emoji: {existing['button_emoji']}")
-            if existing.get("welcome_title"):
-                parts.append(f"welcome_title: {existing['welcome_title']}")
-            if existing.get("welcome_message") and existing["welcome_message"] != "A staff member will assist you shortly.":
-                parts.append(f"welcome: {existing['welcome_message']}")
-            if existing.get("ping_roles"):
-                parts.append(f"ping: {','.join(str(r) for r in existing['ping_roles'])}")
-            if existing.get("max_tickets", 1) != 1:
-                parts.append(f"max: {existing['max_tickets']}")
-            if existing.get("log_channel_id"):
-                parts.append(f"log: {existing['log_channel_id']}")
-            extra_default = "\n".join(parts)
-
-        self.title_input = discord.ui.TextInput(
-            label="Panel title",
-            max_length=100,
-            required=True,
-            placeholder="Support",
-            default=existing.get("title", "") if existing else "",
-        )
-        self.desc_input = discord.ui.TextInput(
-            label="Panel description",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            required=True,
-            placeholder="Click below to open a support ticket.",
-            default=existing.get("description", "") if existing else "",
-        )
-        self.button_input = discord.ui.TextInput(
-            label="Button label",
-            max_length=80,
-            required=False,
-            placeholder="Open Ticket",
-            default=existing.get("button_label", "") if existing else "",
-        )
-        self.channel_input = discord.ui.TextInput(
-            label="Channel name format ({user} {id} {panel})",
-            max_length=100,
-            required=False,
-            placeholder="ticket-{user}",
-            default=existing.get("channel_format", "") if existing else "",
-        )
-        self.extra_input = discord.ui.TextInput(
-            label="Extra settings (one per line)",
-            style=discord.TextStyle.paragraph,
-            max_length=800,
-            required=False,
-            placeholder="category: ID\ncolor: 5865F2\nstyle: primary\nemoji: \U0001f3ab\nwelcome: ...\nping: role_id\nmax: 1\nlog: channel_id",
-            default=extra_default,
-        )
-
-        self.add_item(self.title_input)
-        self.add_item(self.desc_input)
-        self.add_item(self.button_input)
-        self.add_item(self.channel_input)
-        self.add_item(self.extra_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        category_id = None
-        embed_color = "5865F2"
-        button_style = "primary"
-        button_emoji = "\U0001f3ab"
-        welcome_message = "A staff member will assist you shortly."
-        welcome_title = ""
-        ping_roles = []
-        max_tickets = 1
-        log_channel_id = None
-
-        for line in self.extra_input.value.strip().splitlines():
-            line = line.strip()
-            low = line.lower()
-            if low.startswith("category:"):
-                category_id = line.split(":", 1)[1].strip()
-            elif low.startswith("color:"):
-                embed_color = line.split(":", 1)[1].strip().lstrip("#")
-            elif low.startswith("style:"):
-                button_style = line.split(":", 1)[1].strip().lower()
-            elif low.startswith("emoji:"):
-                button_emoji = line.split(":", 1)[1].strip()
-            elif low.startswith("welcome_title:"):
-                welcome_title = line.split(":", 1)[1].strip()
-            elif low.startswith("welcome:"):
-                welcome_message = line.split(":", 1)[1].strip()
-            elif low.startswith("ping:"):
-                raw = line.split(":", 1)[1].strip()
-                ping_roles = [r.strip() for r in raw.split(",") if r.strip()]
-            elif low.startswith("max:"):
-                try:
-                    max_tickets = int(line.split(":", 1)[1].strip())
-                except ValueError:
-                    pass
-            elif low.startswith("log:"):
-                log_channel_id = line.split(":", 1)[1].strip()
-
-        panel_title = self.title_input.value.strip()
-
-        panel_data = {
-            "title": panel_title,
-            "description": self.desc_input.value.strip(),
-            "button_label": self.button_input.value.strip() or "Open Ticket",
-            "button_emoji": button_emoji,
-            "button_style": button_style if button_style in BUTTON_STYLES_MAP else "primary",
-            "channel_format": self.channel_input.value.strip() or "ticket-{user}",
-            "category_id": category_id,
-            "embed_color": embed_color,
-            "welcome_title": welcome_title or f"\U0001f3ab {panel_title}",
-            "welcome_message": welcome_message,
-            "ping_roles": ping_roles,
-            "max_tickets": max_tickets,
-            "log_channel_id": log_channel_id,
-        }
-
-        panels = load_ticket_panels()
-        if not self.panel_id:
-            panel_id = re.sub(r'[^a-z0-9_]', '_', panel_title.lower())
-            if panel_id in panels:
-                panel_id = f"{panel_id}_{int(time.time())}"
-        else:
-            panel_id = self.panel_id
-
-        panels[panel_id] = panel_data
-        save_ticket_panels(panels)
-        bot.add_view(TicketPanelView(panel_id))
-
-        try:
-            color = int(embed_color, 16)
-        except ValueError:
-            color = 0x5865F2
-
-        embed = discord.Embed(title=panel_title, description=panel_data["description"], color=color)
-        embed.set_footer(text=f"Panel ID: {panel_id}")
-
-        await interaction.response.send_message(
-            f"✅ Panel **{panel_title}** saved (`{panel_id}`). Use `/ticketpost` to post it.",
-            embed=embed,
-            ephemeral=True,
-        )
-
-
-async def panel_autocomplete(interaction: discord.Interaction, current: str):
-    panels = load_ticket_panels()
-    matches = [
-        (pid, p["title"]) for pid, p in panels.items()
-        if current.lower() in p["title"].lower() or current.lower() in pid.lower()
-    ]
-    return [app_commands.Choice(name=title, value=pid) for pid, title in matches[:25]]
-
-
-@tree.command(name="ticketcreate", description="Create or edit a ticket panel")
-@app_commands.describe(panel_id="Leave empty to create new, or choose an existing panel to edit")
-@app_commands.autocomplete(panel_id=panel_autocomplete)
-@app_commands.checks.has_permissions(administrator=True)
-async def ticketcreate_cmd(interaction: discord.Interaction, panel_id: str = None):
-    existing = None
-    if panel_id:
-        panels = load_ticket_panels()
-        existing = panels.get(panel_id)
-        if not existing:
-            await interaction.response.send_message("❌ Panel not found.", ephemeral=True)
-            return
-    modal = TicketPanelModal(panel_id=panel_id, existing=existing)
-    await interaction.response.send_modal(modal)
-
-
-@tree.command(name="ticketpost", description="Post a ticket panel in the current channel")
-@app_commands.describe(panel_id="The panel to post")
-@app_commands.autocomplete(panel_id=panel_autocomplete)
-@app_commands.checks.has_permissions(administrator=True)
-async def ticketpost_cmd(interaction: discord.Interaction, panel_id: str):
-    panels = load_ticket_panels()
-    panel = panels.get(panel_id)
-    if not panel:
-        await interaction.response.send_message("❌ Panel not found.", ephemeral=True)
-        return
-
-    try:
-        color = int(panel.get("embed_color", "5865F2"), 16)
-    except ValueError:
-        color = 0x5865F2
-
-    embed = discord.Embed(title=panel["title"], description=panel["description"], color=color)
-    view = TicketPanelView(panel_id)
-    await interaction.channel.send(embed=embed, view=view)
-    await interaction.response.send_message("✅ Panel posted!", ephemeral=True)
-
-
-@tree.command(name="ticketdelete", description="Delete a ticket panel")
-@app_commands.describe(panel_id="The panel to delete")
-@app_commands.autocomplete(panel_id=panel_autocomplete)
-@app_commands.checks.has_permissions(administrator=True)
-async def ticketdelete_cmd(interaction: discord.Interaction, panel_id: str):
-    panels = load_ticket_panels()
-    if panel_id not in panels:
-        await interaction.response.send_message("❌ Panel not found.", ephemeral=True)
-        return
-    name = panels[panel_id]["title"]
-    del panels[panel_id]
-    save_ticket_panels(panels)
-    await interaction.response.send_message(f"\U0001f5d1️ Panel **{name}** deleted.", ephemeral=True)
-
-
-@tree.command(name="ticketlist", description="List all ticket panels")
-@app_commands.checks.has_permissions(administrator=True)
-async def ticketlist_cmd(interaction: discord.Interaction):
-    panels = load_ticket_panels()
-    if not panels:
-        await interaction.response.send_message("No ticket panels configured.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="\U0001f3ab Ticket Panels", color=EMBED_COLOR)
-    for pid, p in panels.items():
-        cat_info = f"Category: <#{p['category_id']}>" if p.get("category_id") else "Default category"
-        embed.add_field(
-            name=p["title"],
-            value=(
-                f"ID: `{pid}`\n"
-                f"Channel: `{p.get('channel_format', 'ticket-{user}')}`\n"
-                f"Max tickets: {p.get('max_tickets', 1)}\n"
-                f"{cat_info}"
-            ),
-            inline=False,
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ─────────────────────────────────────────────
 #  ORDER FLOW (Stripe)
 # ─────────────────────────────────────────────
 
@@ -1485,12 +1058,6 @@ async def on_ready():
     for weight_id in weights:
         bot.add_view(WeightView(weight_id))
 
-    # Ré-enregistrer les TicketPanelViews + TicketActionsView
-    bot.add_view(TicketActionsView())
-    ticket_panels = load_ticket_panels()
-    for pid in ticket_panels:
-        bot.add_view(TicketPanelView(pid))
-
     print(f"✅ Bot connecté en tant que {bot.user} (ID: {bot.user.id})")
 
     if ORDER_PANEL_CHANNEL_ID:
@@ -1516,6 +1083,7 @@ async def order_cmd(interaction: discord.Interaction):
 platform_choices = [
     app_commands.Choice(name="Winsight", value="winsight"),
     app_commands.Choice(name="EngineX", value="enginex"),
+    app_commands.Choice(name="Helios", value="helios"),
 ]
 
 
@@ -1941,6 +1509,60 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
         return False, f"Error: {str(e)}"
 
 
+async def helios_grant(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
+    """Grant access via Helios API — simple POST call."""
+    rid = resource_id or HELIOS_RESOURCE_ID
+    if not HELIOS_API_KEY:
+        return False, "❌ HELIOS_API_KEY not configured."
+    url = f"{HELIOS_API_URL}/resource/{rid}/shares"
+    headers = {
+        "Authorization": f"Bearer {HELIOS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"discord_id": discord_id}
+    print(f"[Helios] Grant: POST {url} discord_id={discord_id}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                status = resp.status
+                body = await resp.text()
+                print(f"[Helios] Response: {status} {body[:200]}")
+                if status == 200:
+                    return True, f"✅ Access granted to `{discord_id}` on Helios."
+                else:
+                    return False, f"❌ Helios API returned {status}: {body[:200]}"
+    except Exception as e:
+        print(f"[Helios] EXCEPTION: {e}")
+        return False, f"Error: {str(e)}"
+
+
+async def helios_revoke(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
+    """Revoke access via Helios API — DELETE call."""
+    rid = resource_id or HELIOS_RESOURCE_ID
+    if not HELIOS_API_KEY:
+        return False, "❌ HELIOS_API_KEY not configured."
+    url = f"{HELIOS_API_URL}/resource/{rid}/shares"
+    headers = {
+        "Authorization": f"Bearer {HELIOS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"discord_id": discord_id}
+    print(f"[Helios] Revoke: DELETE {url} discord_id={discord_id}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                status = resp.status
+                body = await resp.text()
+                print(f"[Helios] Response: {status} {body[:200]}")
+                if status == 200:
+                    return True, f"✅ Access revoked for `{discord_id}` on Helios."
+                else:
+                    return False, f"❌ Helios API returned {status}: {body[:200]}"
+    except Exception as e:
+        print(f"[Helios] EXCEPTION: {e}")
+        return False, f"Error: {str(e)}"
+
+
 async def process_paid_order(order_id: str):
     order = get_order(order_id)
     if not order:
@@ -1950,6 +1572,8 @@ async def process_paid_order(order_id: str):
 
     if platform == "enginex":
         success, message = await enginex_grant(order["buyer_contact"], order["model"])
+    elif platform == "helios":
+        success, message = await helios_grant(order["buyer_contact"])
     else:
         success, message = await winsight_grant(order["buyer_contact"], order["model"])
 
@@ -2263,26 +1887,32 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
-    # model est le nom de groupe (ex: "Valorant") — sert de keyword de recherche
     group_name = model
-    available_platforms = get_platforms_for_group(group_name)
 
-    if platform.value not in available_platforms:
-        await interaction.response.send_message(
-            f"❌ **{group_name}** not configured on **{platform.name}**. "
-            f"Available: {', '.join(available_platforms) or 'none'}",
-            ephemeral=True,
-        )
-        return
+    # Helios n'a pas besoin d'être dans products.json — c'est une API directe
+    if platform.value != "helios":
+        available_platforms = get_platforms_for_group(group_name)
+        if platform.value not in available_platforms:
+            await interaction.response.send_message(
+                f"❌ **{group_name}** not configured on **{platform.name}**. "
+                f"Available: {', '.join(available_platforms) or 'none'}",
+                ephemeral=True,
+            )
+            return
 
     await interaction.response.send_message(
-        f"⏳ Searching Winsight for all weights containing **{group_name}** "
-        f"and granting to `{contact}`...",
+        f"⏳ Granting **{group_name}** on **{platform.name}** to `{contact}`...",
         ephemeral=False,
     )
 
     async def run():
-        if platform.value == "enginex":
+        if platform.value == "helios":
+            # Helios : simple API call, un seul resource
+            ok, msg = await helios_grant(contact)
+            nb_ok = 1 if ok else 0
+            nb_fail = 0 if ok else 1
+            details = [f"{'✓' if ok else '✗'} Helios — {msg}"]
+        elif platform.value == "enginex":
             # EngineX : liste fixe depuis products.json (pas de scraping live)
             all_models = get_models_for_group(group_name)
             products = load_products()
@@ -2298,13 +1928,12 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
             nb_fail = len(models_on_platform) - total_ok
             details = results
         else:
-            # Winsight : scraping dynamique — trouve toutes les weights
-            # dont le nom contient group_name sur la page, peu importe la version
+            # Winsight : scraping dynamique
             nb_ok, nb_fail, details = await winsight_grant_all_dynamic(contact, group_name)
 
         all_ok = nb_fail == 0
         color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
-        prefix = "WIN" if platform.value == "winsight" else "EX"
+        prefix = "WIN" if platform.value == "winsight" else ("HEL" if platform.value == "helios" else "EX")
 
         if all_ok:
             title = f"✅ {prefix} Granted — {group_name}"
@@ -2315,10 +1944,10 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
 
         embed = discord.Embed(title=title, color=color)
 
-        if platform.value == "winsight":
-            embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
-        else:
+        if platform.value == "enginex":
             embed.add_field(name="EngineX Email", value=contact, inline=False)
+        else:
+            embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
 
         embed.add_field(
             name="Result",
