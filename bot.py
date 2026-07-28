@@ -39,7 +39,7 @@ ENGINEX_ENTITLEMENTS_URL = os.environ.get("ENGINEX_ENTITLEMENTS_URL", "https://e
 
 HELIOS_API_KEY = os.environ.get("HELIOS_API_KEY", "")
 HELIOS_RESOURCE_ID = os.environ.get("HELIOS_RESOURCE_ID", "6cabf1d2-8887-4b36-885d-e888b82f7987")
-HELIOS_API_URL = os.environ.get("HELIOS_API_URL", "https://helios.inputsense.com/api/v1")
+HELIOS_API_URL = "https://www.inputsense.com/api/scripts/integration_v1.php"
 
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
 ORDER_PANEL_CHANNEL_ID = int(os.environ.get("ORDER_PANEL_CHANNEL_ID", "0")) or None
@@ -1509,57 +1509,89 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
         return False, f"Error: {str(e)}"
 
 
-async def helios_grant(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
-    """Grant access via Helios API — simple POST call."""
+async def helios_grant(discord_id: str, resource_id: str = None, notes: str = None) -> tuple[bool, str]:
+    """Grant access via Helios/InputSense API."""
     rid = resource_id or HELIOS_RESOURCE_ID
     if not HELIOS_API_KEY:
         return False, "❌ HELIOS_API_KEY not configured."
-    url = f"{HELIOS_API_URL}/resource/{rid}/shares"
+
+    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users"
     headers = {
         "Authorization": f"Bearer {HELIOS_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {"discord_id": discord_id}
+    payload = {
+        "discord_id": str(discord_id),
+        "notes": notes or f"Granted via bot",
+        "expires_at": None,
+    }
     print(f"[Helios] Grant: POST {url} discord_id={discord_id}")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 status = resp.status
-                body = await resp.text()
-                print(f"[Helios] Response: {status} {body[:200]}")
-                if status == 200:
+                body = await resp.json(content_type=None)
+                print(f"[Helios] Response: {status} {body}")
+                if body.get("success"):
                     return True, f"✅ Access granted to `{discord_id}` on Helios."
                 else:
-                    return False, f"❌ Helios API returned {status}: {body[:200]}"
+                    error = body.get("error", {})
+                    return False, f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
     except Exception as e:
         print(f"[Helios] EXCEPTION: {e}")
         return False, f"Error: {str(e)}"
 
 
 async def helios_revoke(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
-    """Revoke access via Helios API — DELETE call."""
+    """Revoke access via Helios/InputSense API."""
     rid = resource_id or HELIOS_RESOURCE_ID
     if not HELIOS_API_KEY:
         return False, "❌ HELIOS_API_KEY not configured."
-    url = f"{HELIOS_API_URL}/resource/{rid}/shares"
+
+    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users/{discord_id}/revoke"
     headers = {
         "Authorization": f"Bearer {HELIOS_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {"discord_id": discord_id}
-    print(f"[Helios] Revoke: DELETE {url} discord_id={discord_id}")
+    print(f"[Helios] Revoke: POST {url}")
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.delete(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.post(url, headers=headers, json={}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 status = resp.status
-                body = await resp.text()
-                print(f"[Helios] Response: {status} {body[:200]}")
-                if status == 200:
+                body = await resp.json(content_type=None)
+                print(f"[Helios] Response: {status} {body}")
+                if body.get("success"):
                     return True, f"✅ Access revoked for `{discord_id}` on Helios."
                 else:
-                    return False, f"❌ Helios API returned {status}: {body[:200]}"
+                    error = body.get("error", {})
+                    return False, f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
     except Exception as e:
         print(f"[Helios] EXCEPTION: {e}")
+        return False, f"Error: {str(e)}"
+
+
+async def helios_check(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
+    """Check if a user has access via Helios/InputSense API."""
+    rid = resource_id or HELIOS_RESOURCE_ID
+    if not HELIOS_API_KEY:
+        return False, "❌ HELIOS_API_KEY not configured."
+
+    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users&limit=200&offset=0"
+    headers = {
+        "Authorization": f"Bearer {HELIOS_API_KEY}",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                body = await resp.json(content_type=None)
+                if not body.get("success"):
+                    return False, f"❌ Helios API error: {body}"
+                users = body.get("data", [])
+                for user in users:
+                    if str(user.get("discord_id", "")) == str(discord_id):
+                        return True, f"✅ `{discord_id}` has access on Helios."
+                return False, f"❌ `{discord_id}` does NOT have access on Helios."
+    except Exception as e:
         return False, f"Error: {str(e)}"
 
 
