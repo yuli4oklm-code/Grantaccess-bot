@@ -2190,6 +2190,11 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
                                     await interaction.followup.send(f"❌ Helios API error for {name}: {raw[:200]}", ephemeral=True)
                                     continue
                                 users = body.get("data", [])
+                                # data peut être un dict avec une clé "items" ou "records", ou directement une list
+                                if isinstance(users, dict):
+                                    users = users.get("items", users.get("records", list(users.values())))
+                                if not isinstance(users, list):
+                                    users = []
                                 if not users:
                                     embed = discord.Embed(
                                         title=f"👥 {name} — No users",
@@ -2199,6 +2204,12 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
                                 else:
                                     lines = []
                                     for i, user in enumerate(users, 1):
+                                        if isinstance(user, str):
+                                            lines.append(f"`{i}.` `{user}`")
+                                            continue
+                                        if not isinstance(user, dict):
+                                            lines.append(f"`{i}.` `{user}`")
+                                            continue
                                         did = user.get("discord_id", "?")
                                         notes = user.get("notes", "")
                                         expires = user.get("expires_at", "never")
