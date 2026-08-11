@@ -40,8 +40,6 @@ ENGINEX_ENTITLEMENTS_URL = os.environ.get("ENGINEX_ENTITLEMENTS_URL", "https://e
 HELIOS_API_KEY = os.environ.get("HELIOS_API_KEY", "")
 HELIOS_API_URL = "https://www.inputsense.com/api/scripts/integration_v1.php"
 
-HELIOS_RESOURCES_FILE = os.path.join(DATA_DIR, "helios_resources.json")
-
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
 ORDER_PANEL_CHANNEL_ID = int(os.environ.get("ORDER_PANEL_CHANNEL_ID", "0")) or None
 VOUCH_CHANNEL_ID = int(os.environ.get("VOUCH_CHANNEL_ID", "0")) or None
@@ -53,6 +51,7 @@ ORDERS_FILE = os.path.join(DATA_DIR, "winsight_orders.json")
 PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
 WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
+HELIOS_RESOURCES_FILE = os.path.join(DATA_DIR, "helios_resources.json")
 
 EMBED_COLOR = 0x2F3136
 CONFIG_BACKUP_MARKER = "WINSIGHT_BOT_CONFIG_BACKUP_V1"
