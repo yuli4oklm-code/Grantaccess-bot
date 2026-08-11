@@ -1563,13 +1563,17 @@ async def helios_grant(discord_id: str, resource_id: str = None, notes: str = No
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                body = await resp.json(content_type=None)
-                print(f"[Helios] Response: {resp.status} {body}")
-                if body.get("success"):
+                raw = await resp.text()
+                print(f"[Helios] Grant response: {resp.status} {raw[:300]}")
+                try:
+                    body = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    return False, f"✗ Helios ({resource_id[:8]}...): non-JSON response: {raw[:100]}"
+                if isinstance(body, dict) and body.get("success"):
                     return True, f"✓ Helios ({resource_id[:8]}...)"
                 else:
-                    error = body.get("error", {})
-                    return False, f"✗ Helios ({resource_id[:8]}...): {error.get('code', 'unknown')} — {error.get('message', str(body))}"
+                    error = body.get("error", {}) if isinstance(body, dict) else {}
+                    return False, f"✗ Helios ({resource_id[:8]}...): {error.get('code', 'unknown')} — {error.get('message', raw[:100])}"
     except Exception as e:
         return False, f"✗ Helios error: {str(e)}"
 
@@ -1590,13 +1594,17 @@ async def helios_revoke(discord_id: str, resource_id: str = None) -> tuple[bool,
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json={}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                body = await resp.json(content_type=None)
-                print(f"[Helios] Response: {resp.status} {body}")
-                if body.get("success"):
+                raw = await resp.text()
+                print(f"[Helios] Revoke response: {resp.status} {raw[:300]}")
+                try:
+                    body = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    return False, f"✗ Helios ({resource_id[:8]}...): non-JSON response: {raw[:100]}"
+                if isinstance(body, dict) and body.get("success"):
                     return True, f"✓ Helios ({resource_id[:8]}...)"
                 else:
-                    error = body.get("error", {})
-                    return False, f"✗ Helios ({resource_id[:8]}...): {error.get('code', 'unknown')} — {error.get('message', str(body))}"
+                    error = body.get("error", {}) if isinstance(body, dict) else {}
+                    return False, f"✗ Helios ({resource_id[:8]}...): {error.get('code', 'unknown')} — {error.get('message', raw[:100])}"
     except Exception as e:
         return False, f"✗ Helios error: {str(e)}"
 
@@ -1613,9 +1621,13 @@ async def helios_check(discord_id: str, resource_id: str = None) -> tuple[bool, 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                body = await resp.json(content_type=None)
-                if not body.get("success"):
-                    return False, f"❌ Helios API error: {body}"
+                raw = await resp.text()
+                try:
+                    body = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    return False, f"❌ Helios non-JSON response: {raw[:100]}"
+                if not isinstance(body, dict) or not body.get("success"):
+                    return False, f"❌ Helios API error: {raw[:200]}"
                 users = body.get("data", [])
                 for user in users:
                     if str(user.get("discord_id", "")) == str(discord_id):
@@ -2167,9 +2179,15 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
                     try:
                         async with aiohttp.ClientSession() as session:
                             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                                body = await resp.json(content_type=None)
-                                if not body.get("success"):
-                                    await interaction.followup.send(f"❌ Helios API error for {name}: {body}", ephemeral=True)
+                                raw = await resp.text()
+                                print(f"[Helios Check List] {name}: status={resp.status} body={raw[:300]}")
+                                try:
+                                    body = json.loads(raw)
+                                except (json.JSONDecodeError, TypeError):
+                                    await interaction.followup.send(f"❌ Helios returned non-JSON for {name}: `{raw[:200]}`", ephemeral=True)
+                                    continue
+                                if not isinstance(body, dict) or not body.get("success"):
+                                    await interaction.followup.send(f"❌ Helios API error for {name}: {raw[:200]}", ephemeral=True)
                                     continue
                                 users = body.get("data", [])
                                 if not users:
