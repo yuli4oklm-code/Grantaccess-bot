@@ -38,8 +38,9 @@ ENGINEX_LOGIN_URL = os.environ.get("ENGINEX_LOGIN_URL", "https://enginex-ex.com/
 ENGINEX_ENTITLEMENTS_URL = os.environ.get("ENGINEX_ENTITLEMENTS_URL", "https://enginex-ex.com/entitlements")
 
 HELIOS_API_KEY = os.environ.get("HELIOS_API_KEY", "")
-HELIOS_RESOURCE_ID = os.environ.get("HELIOS_RESOURCE_ID", "6cabf1d2-8887-4b36-885d-e888b82f7987")
 HELIOS_API_URL = "https://www.inputsense.com/api/scripts/integration_v1.php"
+
+HELIOS_RESOURCES_FILE = os.path.join(DATA_DIR, "helios_resources.json")
 
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
 ORDER_PANEL_CHANNEL_ID = int(os.environ.get("ORDER_PANEL_CHANNEL_ID", "0")) or None
@@ -177,6 +178,18 @@ def load_weights():
 
 def save_weights(data):
     save_json(WEIGHTS_FILE, data)
+
+
+def load_helios_resources():
+    """
+    Retourne un dict {group_name: resource_uuid}.
+    Ex: {"Valorant": "6cabf1d2-...", "Marvels": "10e60180-..."}
+    """
+    return load_json(HELIOS_RESOURCES_FILE, {})
+
+
+def save_helios_resources(data):
+    save_json(HELIOS_RESOURCES_FILE, data)
 
 
 def create_order(order_id, buyer_id, buyer_contact, model, platform, stripe_session_id):
@@ -1510,45 +1523,45 @@ async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
 
 
 async def helios_grant(discord_id: str, resource_id: str = None, notes: str = None) -> tuple[bool, str]:
-    """Grant access via Helios/InputSense API."""
-    rid = resource_id or HELIOS_RESOURCE_ID
+    """Grant access via Helios/InputSense API pour un resource_id donné."""
     if not HELIOS_API_KEY:
         return False, "❌ HELIOS_API_KEY not configured."
+    if not resource_id:
+        return False, "❌ No Helios resource ID provided."
 
-    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users"
+    url = f"{HELIOS_API_URL}?route=items/{resource_id}/authorized-users"
     headers = {
         "Authorization": f"Bearer {HELIOS_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
         "discord_id": str(discord_id),
-        "notes": notes or f"Granted via bot",
+        "notes": notes or "Granted via bot",
         "expires_at": None,
     }
     print(f"[Helios] Grant: POST {url} discord_id={discord_id}")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                status = resp.status
                 body = await resp.json(content_type=None)
-                print(f"[Helios] Response: {status} {body}")
+                print(f"[Helios] Response: {resp.status} {body}")
                 if body.get("success"):
-                    return True, f"✅ Access granted to `{discord_id}` on Helios."
+                    return True, f"✓ Helios ({resource_id[:8]}...)"
                 else:
                     error = body.get("error", {})
-                    return False, f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
+                    return False, f"✗ Helios ({resource_id[:8]}...): {error.get('code', 'unknown')} — {error.get('message', str(body))}"
     except Exception as e:
-        print(f"[Helios] EXCEPTION: {e}")
-        return False, f"Error: {str(e)}"
+        return False, f"✗ Helios error: {str(e)}"
 
 
 async def helios_revoke(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
     """Revoke access via Helios/InputSense API."""
-    rid = resource_id or HELIOS_RESOURCE_ID
     if not HELIOS_API_KEY:
         return False, "❌ HELIOS_API_KEY not configured."
+    if not resource_id:
+        return False, "❌ No Helios resource ID provided."
 
-    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users/{discord_id}/revoke"
+    url = f"{HELIOS_API_URL}?route=items/{resource_id}/authorized-users/{discord_id}/revoke"
     headers = {
         "Authorization": f"Bearer {HELIOS_API_KEY}",
         "Content-Type": "application/json",
@@ -1557,29 +1570,26 @@ async def helios_revoke(discord_id: str, resource_id: str = None) -> tuple[bool,
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json={}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                status = resp.status
                 body = await resp.json(content_type=None)
-                print(f"[Helios] Response: {status} {body}")
+                print(f"[Helios] Response: {resp.status} {body}")
                 if body.get("success"):
-                    return True, f"✅ Access revoked for `{discord_id}` on Helios."
+                    return True, f"✓ Helios ({resource_id[:8]}...)"
                 else:
                     error = body.get("error", {})
-                    return False, f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
+                    return False, f"✗ Helios ({resource_id[:8]}...): {error.get('code', 'unknown')} — {error.get('message', str(body))}"
     except Exception as e:
-        print(f"[Helios] EXCEPTION: {e}")
-        return False, f"Error: {str(e)}"
+        return False, f"✗ Helios error: {str(e)}"
 
 
 async def helios_check(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
     """Check if a user has access via Helios/InputSense API."""
-    rid = resource_id or HELIOS_RESOURCE_ID
     if not HELIOS_API_KEY:
         return False, "❌ HELIOS_API_KEY not configured."
+    if not resource_id:
+        return False, "❌ No Helios resource ID provided."
 
-    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users&limit=200&offset=0"
-    headers = {
-        "Authorization": f"Bearer {HELIOS_API_KEY}",
-    }
+    url = f"{HELIOS_API_URL}?route=items/{resource_id}/authorized-users&limit=200&offset=0"
+    headers = {"Authorization": f"Bearer {HELIOS_API_KEY}"}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -1589,10 +1599,49 @@ async def helios_check(discord_id: str, resource_id: str = None) -> tuple[bool, 
                 users = body.get("data", [])
                 for user in users:
                     if str(user.get("discord_id", "")) == str(discord_id):
-                        return True, f"✅ `{discord_id}` has access on Helios."
-                return False, f"❌ `{discord_id}` does NOT have access on Helios."
+                        return True, f"✅ `{discord_id}` has access ({resource_id[:8]}...)"
+                return False, f"❌ `{discord_id}` does NOT have access ({resource_id[:8]}...)"
     except Exception as e:
         return False, f"Error: {str(e)}"
+
+
+async def helios_grant_group(discord_id: str, group_name: str) -> tuple[int, int, list[str]]:
+    """Grant access sur tous les resource IDs Helios associés au groupe."""
+    helios_res = load_helios_resources()
+    # Cherche toutes les entrées qui matchent le group_name
+    matching = {name: rid for name, rid in helios_res.items() if group_name.lower() in name.lower()}
+    if not matching:
+        return 0, 0, [f"⚠️ Aucune ressource Helios enregistrée pour « {group_name} ». Utilise `/sethelios`."]
+    successes = 0
+    failures = 0
+    details = []
+    for name, rid in matching.items():
+        ok, msg = await helios_grant(discord_id, rid)
+        if ok:
+            successes += 1
+        else:
+            failures += 1
+        details.append(f"{msg} ({name})")
+    return successes, failures, details
+
+
+async def helios_revoke_group(discord_id: str, group_name: str) -> tuple[int, int, list[str]]:
+    """Revoke access sur tous les resource IDs Helios associés au groupe."""
+    helios_res = load_helios_resources()
+    matching = {name: rid for name, rid in helios_res.items() if group_name.lower() in name.lower()}
+    if not matching:
+        return 0, 0, [f"⚠️ Aucune ressource Helios enregistrée pour « {group_name} »."]
+    successes = 0
+    failures = 0
+    details = []
+    for name, rid in matching.items():
+        ok, msg = await helios_revoke(discord_id, rid)
+        if ok:
+            successes += 1
+        else:
+            failures += 1
+        details.append(f"{msg} ({name})")
+    return successes, failures, details
 
 
 async def process_paid_order(order_id: str):
@@ -1605,7 +1654,13 @@ async def process_paid_order(order_id: str):
     if platform == "enginex":
         success, message = await enginex_grant(order["buyer_contact"], order["model"])
     elif platform == "helios":
-        success, message = await helios_grant(order["buyer_contact"])
+        helios_res = load_helios_resources()
+        group = get_game_group(order["model"])
+        rid = helios_res.get(group) or helios_res.get(order["model"])
+        if rid:
+            success, message = await helios_grant(order["buyer_contact"], rid)
+        else:
+            success, message = False, "No Helios resource ID configured for this model."
     else:
         success, message = await winsight_grant(order["buyer_contact"], order["model"])
 
@@ -1841,6 +1896,45 @@ def get_platforms_for_model(model_name: str) -> list:
     return list(load_products().get(model_name, {}).keys())
 
 
+@tree.command(name="sethelios", description="Lier un jeu à un Resource ID Helios")
+@app_commands.describe(
+    name="Nom du jeu/modèle (ex: Valorant, Marvels)",
+    resource_id="UUID de la ressource Helios (ex: 6cabf1d2-8887-4b36-885d-e888b82f7987)",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def sethelios_cmd(interaction: discord.Interaction, name: str, resource_id: str):
+    helios_res = load_helios_resources()
+    helios_res[name] = resource_id
+    save_helios_resources(helios_res)
+    await interaction.response.send_message(
+        f"✅ Helios: **{name}** → `{resource_id}`", ephemeral=False
+    )
+
+
+@tree.command(name="removehelios", description="Supprimer un lien jeu → Helios")
+@app_commands.checks.has_permissions(administrator=True)
+async def removehelios_cmd(interaction: discord.Interaction, name: str):
+    helios_res = load_helios_resources()
+    if name not in helios_res:
+        await interaction.response.send_message(f"⚠️ **{name}** not found in Helios resources.", ephemeral=True)
+        return
+    del helios_res[name]
+    save_helios_resources(helios_res)
+    await interaction.response.send_message(f"🚫 Helios: **{name}** removed.", ephemeral=False)
+
+
+@tree.command(name="helioslist", description="Lister les ressources Helios enregistrées")
+@app_commands.checks.has_permissions(administrator=True)
+async def helioslist_cmd(interaction: discord.Interaction):
+    helios_res = load_helios_resources()
+    if not helios_res:
+        await interaction.response.send_message("Aucune ressource Helios enregistrée.", ephemeral=True)
+        return
+    lines = [f"● **{name}** → `{rid}`" for name, rid in helios_res.items()]
+    embed = discord.Embed(title="🔑 Helios Resources", description="\n".join(lines), color=EMBED_COLOR)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @tree.command(name="setpipeline", description="Enregistrer le nom exact d'une pipeline sur Winsight")
 @app_commands.checks.has_permissions(administrator=True)
 async def setpipeline_cmd(interaction: discord.Interaction, pipeline: str, site_name: str):
@@ -1939,11 +2033,8 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
 
     async def run():
         if platform.value == "helios":
-            # Helios : simple API call, un seul resource
-            ok, msg = await helios_grant(contact)
-            nb_ok = 1 if ok else 0
-            nb_fail = 0 if ok else 1
-            details = [f"{'✓' if ok else '✗'} Helios — {msg}"]
+            # Helios : API call pour chaque resource_id associé au groupe
+            nb_ok, nb_fail, details = await helios_grant_group(contact, group_name)
         elif platform.value == "enginex":
             # EngineX : liste fixe depuis products.json (pas de scraping live)
             all_models = get_models_for_group(group_name)
@@ -2001,17 +2092,109 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run())
 
 
-@tree.command(name="checkaccess", description="Vérifier si un client a accès à un jeu (toutes versions)")
+@tree.command(name="checkaccess", description="Vérifier l'accès — ou lister tous les users Helios d'un modèle")
+@app_commands.describe(
+    model="Le jeu à vérifier",
+    platform="La plateforme",
+    contact="ID Discord (Winsight/Helios) ou email (EngineX) — laisser vide pour lister tous les users Helios",
+)
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
-async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
+async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str = None):
     group_name = model
+
+    if platform.value == "helios":
+        helios_res = load_helios_resources()
+        matching = {name: rid for name, rid in helios_res.items() if group_name.lower() in name.lower()}
+        if not matching:
+            await interaction.response.send_message(
+                f"❌ Aucune ressource Helios pour **{group_name}**. Utilise `/sethelios`.", ephemeral=True
+            )
+            return
+
+        if contact:
+            # Check un user spécifique
+            await interaction.response.send_message(
+                f"⏳ Checking Helios access for `{contact}`...", ephemeral=True
+            )
+
+            async def run():
+                lines = []
+                for name, rid in matching.items():
+                    _, msg = await helios_check(contact, rid)
+                    lines.append(f"**{name}**: {msg}")
+                embed = discord.Embed(
+                    title=f"🔍 Helios Check — {group_name}",
+                    description="\n".join(lines),
+                    color=0x5865F2,
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+
+            asyncio.create_task(run())
+        else:
+            # Lister TOUS les users qui ont accès
+            await interaction.response.send_message(
+                f"⏳ Fetching all users with access to **{group_name}** on Helios...", ephemeral=True
+            )
+
+            async def run():
+                for name, rid in matching.items():
+                    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users&limit=200&offset=0"
+                    headers = {"Authorization": f"Bearer {HELIOS_API_KEY}"}
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                                body = await resp.json(content_type=None)
+                                if not body.get("success"):
+                                    await interaction.followup.send(f"❌ Helios API error for {name}: {body}", ephemeral=True)
+                                    continue
+                                users = body.get("data", [])
+                                if not users:
+                                    embed = discord.Embed(
+                                        title=f"👥 {name} — No users",
+                                        description="Aucun utilisateur n'a accès.",
+                                        color=0x2F3136,
+                                    )
+                                else:
+                                    lines = []
+                                    for i, user in enumerate(users, 1):
+                                        did = user.get("discord_id", "?")
+                                        notes = user.get("notes", "")
+                                        expires = user.get("expires_at", "never")
+                                        line = f"`{i}.` <@{did}> (`{did}`)"
+                                        if notes:
+                                            line += f" — {notes}"
+                                        if expires and expires != "never":
+                                            line += f" ⏰ {expires}"
+                                        lines.append(line)
+                                    # Split en chunks de 4096 chars si nécessaire
+                                    desc = "\n".join(lines)
+                                    if len(desc) > 4000:
+                                        desc = desc[:4000] + f"\n... et {len(users) - len(lines)} de plus"
+                                    embed = discord.Embed(
+                                        title=f"👥 {name} — {len(users)} user(s)",
+                                        description=desc,
+                                        color=0x5865F2,
+                                    )
+                                    embed.set_footer(text=f"Resource: {rid}")
+                                await interaction.followup.send(embed=embed, ephemeral=True)
+                    except Exception as e:
+                        await interaction.followup.send(f"❌ Error fetching {name}: {e}", ephemeral=True)
+
+            asyncio.create_task(run())
+        return
+
+    # Winsight / EngineX — logique existante
     available_platforms = get_platforms_for_group(group_name)
     if platform.value not in available_platforms:
         await interaction.response.send_message(
             f"❌ **{group_name}** not configured on **{platform.name}**.", ephemeral=True
         )
+        return
+
+    if not contact:
+        await interaction.response.send_message("❌ `contact` est requis pour Winsight/EngineX.", ephemeral=True)
         return
 
     all_models = get_models_for_group(group_name)
@@ -2040,43 +2223,51 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run())
 
 
-@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight uniquement, toutes versions)")
+@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight ou Helios)")
+@app_commands.describe(
+    model="Le jeu à révoquer",
+    platform="La plateforme (Winsight ou Helios)",
+    contact="ID Discord du client",
+)
 @app_commands.autocomplete(model=model_autocomplete)
+@app_commands.choices(platform=[
+    app_commands.Choice(name="Winsight", value="winsight"),
+    app_commands.Choice(name="Helios", value="helios"),
+])
 @app_commands.checks.has_permissions(administrator=True)
-async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str):
+async def revoke_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
     group_name = model
-    available_platforms = get_platforms_for_group(group_name)
-    if "winsight" not in available_platforms:
-        await interaction.response.send_message(
-            f"❌ **{group_name}** not on Winsight.", ephemeral=True
-        )
-        return
-
-    all_models = get_models_for_group(group_name)
-    products = load_products()
-    models_on_winsight = [m for m in all_models if "winsight" in products.get(m, {})]
 
     await interaction.response.send_message(
-        f"⏳ Revoking **{group_name}** ({len(models_on_winsight)} version(s)) for `{contact}`...", ephemeral=True
+        f"⏳ Revoking **{group_name}** on **{platform.name}** from `{contact}`...",
+        ephemeral=False,
     )
 
     async def run():
-        lines = []
-        nb_ok = 0
-        for m in models_on_winsight:
-            ok, msg = await winsight_revoke(contact, m)
-            lines.append(f"{'✓' if ok else '✗'} {get_display_name(m)}: {msg}")
-            if ok:
-                nb_ok += 1
-        nb_fail = len(models_on_winsight) - nb_ok
-        all_ok = nb_fail == 0
-        embed = discord.Embed(
-            title=f"{'✅' if all_ok else '⚠️'} Revoke — {group_name}",
-            description="\n".join(lines),
-            color=0x57F287 if all_ok else 0xF1C40F,
-        )
+        if platform.value == "helios":
+            nb_ok, nb_fail, details = await helios_revoke_group(contact, group_name)
+        else:
+            nb_ok, nb_fail, details = await winsight_revoke_all_dynamic(contact, group_name)
+
+        all_ok = nb_fail == 0 and nb_ok > 0
+        color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
+        prefix = "HEL" if platform.value == "helios" else "WIN"
+
+        if all_ok:
+            title = f"✅ {prefix} Revoked — {group_name}"
+        elif nb_ok > 0:
+            title = f"⚠️ {prefix} Partial Revoke — {group_name}"
+        else:
+            title = f"❌ {prefix} Revoke Failed — {group_name}"
+
+        embed = discord.Embed(title=title, color=color)
+        embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
         embed.add_field(name="Result", value=f"{nb_ok} revoked, {nb_fail} failed", inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        embed.add_field(name="Details", value="\n".join(details) or "—", inline=False)
+        embed.set_footer(text=f"Revoke • by {interaction.user}")
+
+        await interaction.channel.send(embed=embed)
+        await interaction.followup.send("✅ Result posted above.", ephemeral=True)
 
     asyncio.create_task(run())
 
