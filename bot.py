@@ -314,7 +314,11 @@ async def restore_config_from_discord():
         save_json(PRODUCTS_FILE, payload["products"])
     if "pipelines" in payload:
         save_pipelines(payload["pipelines"])
-    print("[Config Backup] Restored products/pipelines from Discord backup.")
+    if "weights" in payload:
+        save_weights(payload["weights"])
+    if "helios_resources" in payload:
+        save_helios_resources(payload["helios_resources"])
+    print("[Config Backup] Restored all config from Discord backup.")
     return True
 
 
@@ -324,24 +328,38 @@ async def backup_config_to_discord(reason="manual update"):
         print("[Config Backup] STAFF_CHANNEL_ID is not configured; backup skipped.")
         return
     payload = {
-        "version": 1,
+        "version": 2,
         "updated_at": int(time.time()),
         "reason": reason,
         "products": load_products(),
         "pipelines": load_pipelines(),
+        "weights": load_weights(),
+        "helios_resources": load_helios_resources(),
     }
     content = f"{CONFIG_BACKUP_MARKER}\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
     if len(content) > 2000:
-        print("[Config Backup] Backup is too large for one Discord message; backup skipped.")
+        # Trop gros pour un message Discord — envoyer en fichier attaché
+        print(f"[Config Backup] Backup too large ({len(content)} chars), sending as file...")
+        try:
+            import io
+            file_data = json.dumps(payload, ensure_ascii=False, indent=2)
+            file = discord.File(io.BytesIO(file_data.encode("utf-8")), filename="config_backup.json")
+            message = await find_config_backup_message()
+            marker_content = f"{CONFIG_BACKUP_MARKER}\n(see attached file)"
+            if message:
+                await message.delete()
+            await channel.send(marker_content, file=file)
+            print(f"[Config Backup] Sent as file ({reason}).")
+        except Exception as e:
+            print(f"[Config Backup] Could not write Discord backup: {e}")
         return
     try:
         message = await find_config_backup_message()
         if message:
             await message.edit(content=content)
-            print(f"[Config Backup] Updated Discord backup ({reason}).")
         else:
             await channel.send(content)
-            print(f"[Config Backup] Created Discord backup ({reason}).")
+        print(f"[Config Backup] Updated Discord backup ({reason}).")
     except Exception as e:
         print(f"[Config Backup] Could not write Discord backup: {e}")
 
@@ -726,6 +744,7 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
 
         weights[weight_id] = weight_data
         save_weights(weights)
+        asyncio.create_task(backup_config_to_discord("weight saved"))
 
         embed = build_weight_embed(weight_data)
         view = WeightView(weight_id)
@@ -793,6 +812,7 @@ class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
         weights[self.weight_id]["specs_win"] = self.specs_win.value.strip()
         weights[self.weight_id]["specs_ex"] = self.specs_ex.value.strip()
         save_weights(weights)
+        asyncio.create_task(backup_config_to_discord("specs updated"))
 
         embed = build_specs_embed(weights[self.weight_id])
         await interaction.response.send_message(
@@ -877,6 +897,7 @@ async def weightdelete_cmd(interaction: discord.Interaction, weight_id: str):
     del weights[weight_id]
     save_weights(weights)
     await interaction.response.send_message(f"🗑️ Weight **{name}** deleted.", ephemeral=True)
+    await backup_config_to_discord("weightdelete")
 
 
 @tree.command(name="weightlist", description="Lister tous les weights enregistrés")
@@ -1909,6 +1930,7 @@ async def sethelios_cmd(interaction: discord.Interaction, name: str, resource_id
     await interaction.response.send_message(
         f"✅ Helios: **{name}** → `{resource_id}`", ephemeral=False
     )
+    await backup_config_to_discord("sethelios")
 
 
 @tree.command(name="removehelios", description="Supprimer un lien jeu → Helios")
@@ -1921,6 +1943,7 @@ async def removehelios_cmd(interaction: discord.Interaction, name: str):
     del helios_res[name]
     save_helios_resources(helios_res)
     await interaction.response.send_message(f"🚫 Helios: **{name}** removed.", ephemeral=False)
+    await backup_config_to_discord("removehelios")
 
 
 @tree.command(name="helioslist", description="Lister les ressources Helios enregistrées")
