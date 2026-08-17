@@ -1,6 +1,7 @@
 """
-Bot Discord séparé : commande Stripe + livraison automatique sur Winsight via Playwright.
+Bot Discord : commande Stripe + livraison automatique des weights via l'API Winsight.
 + /weight system avec specs, tickets, et order flow
++ multi-serveur (config par guild via /setup)
 """
 
 import discord
@@ -12,10 +13,10 @@ import json
 import threading
 import time
 import re
+from urllib.parse import urlparse, quote
 
 import stripe
 from flask import Flask, request, jsonify
-from playwright.async_api import async_playwright
 import aiohttp
 
 # ─────────────────────────────────────────────
@@ -32,18 +33,18 @@ WINSIGHT_USERNAME = os.environ.get("WINSIGHT_USERNAME", "")
 WINSIGHT_PASSWORD = os.environ.get("WINSIGHT_PASSWORD", "")
 WINSIGHT_URL = os.environ.get("WINSIGHT_URL", "https://winsight.info/px3-8kd4b7e2a1f9")
 
-ENGINEX_USERNAME = os.environ.get("ENGINEX_USERNAME", "")
-ENGINEX_PASSWORD = os.environ.get("ENGINEX_PASSWORD", "")
-ENGINEX_LOGIN_URL = os.environ.get("ENGINEX_LOGIN_URL", "https://enginex-ex.com/auth/signin")
-ENGINEX_ENTITLEMENTS_URL = os.environ.get("ENGINEX_ENTITLEMENTS_URL", "https://enginex-ex.com/entitlements")
-
 HELIOS_API_KEY = os.environ.get("HELIOS_API_KEY", "")
+HELIOS_RESOURCE_ID = os.environ.get("HELIOS_RESOURCE_ID", "6cabf1d2-8887-4b36-885d-e888b82f7987")
 HELIOS_API_URL = "https://www.inputsense.com/api/scripts/integration_v1.php"
 
+# Valeurs par défaut (serveur principal). Chaque serveur peut les surcharger avec /setup.
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
 ORDER_PANEL_CHANNEL_ID = int(os.environ.get("ORDER_PANEL_CHANNEL_ID", "0")) or None
 VOUCH_CHANNEL_ID = int(os.environ.get("VOUCH_CHANNEL_ID", "0")) or None
 TICKET_CATEGORY_ID = int(os.environ.get("TICKET_CATEGORY_ID", "1513173071916302499")) or None
+
+# Le backup de config est stocké dans ce salon (global, pas par serveur).
+BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID", "0")) or STAFF_CHANNEL_ID
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -51,7 +52,7 @@ ORDERS_FILE = os.path.join(DATA_DIR, "winsight_orders.json")
 PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
 WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
-HELIOS_RESOURCES_FILE = os.path.join(DATA_DIR, "helios_resources.json")
+GUILDS_FILE = os.path.join(DATA_DIR, "guilds.json")
 
 EMBED_COLOR = 0x2F3136
 CONFIG_BACKUP_MARKER = "WINSIGHT_BOT_CONFIG_BACKUP_V1"
@@ -179,19 +180,76 @@ def save_weights(data):
     save_json(WEIGHTS_FILE, data)
 
 
-def load_helios_resources():
+# ─────────────────────────────────────────────
+#  CONFIG PAR SERVEUR (multi-guild)
+# ─────────────────────────────────────────────
+
+# Clés de config par serveur → valeur par défaut (env var du serveur principal).
+GUILD_CONFIG_DEFAULTS = {
+    "staff_channel_id": STAFF_CHANNEL_ID,
+    "order_panel_channel_id": ORDER_PANEL_CHANNEL_ID,
+    "vouch_channel_id": VOUCH_CHANNEL_ID,
+    "ticket_category_id": TICKET_CATEGORY_ID,
+}
+
+
+def load_guilds():
+    return load_json(GUILDS_FILE, {})
+
+
+def save_guilds(data):
+    save_json(GUILDS_FILE, data)
+
+
+def get_guild_config(guild_id) -> dict:
     """
-    Retourne un dict {group_name: resource_uuid}.
-    Ex: {"Valorant": "6cabf1d2-...", "Marvels": "10e60180-..."}
+    Retourne la config d'un serveur. Les clés non définies retombent sur les
+    valeurs par défaut (env vars) — pratique pour le serveur principal qui
+    n'a rien à configurer.
     """
-    return load_json(HELIOS_RESOURCES_FILE, {})
+    stored = load_guilds().get(str(guild_id), {}) if guild_id else {}
+    config = dict(GUILD_CONFIG_DEFAULTS)
+    for key, value in stored.items():
+        if key in config:
+            config[key] = value or None
+    return config
 
 
-def save_helios_resources(data):
-    save_json(HELIOS_RESOURCES_FILE, data)
+def set_guild_config(guild_id, **kwargs):
+    """Enregistre une ou plusieurs clés de config pour un serveur."""
+    data = load_guilds()
+    entry = data.setdefault(str(guild_id), {})
+    for key, value in kwargs.items():
+        if key not in GUILD_CONFIG_DEFAULTS:
+            continue
+        if value is None:
+            entry.pop(key, None)
+        else:
+            entry[key] = value
+    save_guilds(data)
 
 
-def create_order(order_id, buyer_id, buyer_contact, model, platform, stripe_session_id):
+def get_guild_channel(guild_id, key):
+    """
+    Récupère un salon Discord depuis la config du serveur (ou None).
+
+    On vérifie que le salon appartient bien au serveur demandé : sinon un
+    second serveur non configuré hériterait des salons du serveur principal
+    (via les env vars par défaut) et enverrait ses tickets/avis chez nous.
+    """
+    channel_id = get_guild_config(guild_id).get(key)
+    if not channel_id:
+        return None
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        return None
+    guild = getattr(channel, "guild", None)
+    if guild_id and guild and guild.id != int(guild_id):
+        return None
+    return channel
+
+
+def create_order(order_id, buyer_id, buyer_contact, model, platform, stripe_session_id, guild_id=None):
     data = load_orders()
     data[order_id] = {
         "buyer_id": buyer_id,
@@ -199,6 +257,7 @@ def create_order(order_id, buyer_id, buyer_contact, model, platform, stripe_sess
         "model": model,
         "platform": platform,
         "stripe_session_id": stripe_session_id,
+        "guild_id": guild_id,
         "status": "pending_payment",
         "staff_message_id": None,
         "created_at": time.time(),
@@ -264,13 +323,13 @@ main_loop = None
 
 
 async def get_config_backup_channel():
-    if not STAFF_CHANNEL_ID:
+    if not BACKUP_CHANNEL_ID:
         return None
-    channel = bot.get_channel(STAFF_CHANNEL_ID)
+    channel = bot.get_channel(BACKUP_CHANNEL_ID)
     if channel:
         return channel
     try:
-        return await bot.fetch_channel(STAFF_CHANNEL_ID)
+        return await bot.fetch_channel(BACKUP_CHANNEL_ID)
     except Exception as e:
         print(f"[Config Backup] Could not fetch staff channel: {e}")
         return None
@@ -313,52 +372,34 @@ async def restore_config_from_discord():
         save_json(PRODUCTS_FILE, payload["products"])
     if "pipelines" in payload:
         save_pipelines(payload["pipelines"])
-    if "weights" in payload:
-        save_weights(payload["weights"])
-    if "helios_resources" in payload:
-        save_helios_resources(payload["helios_resources"])
-    print("[Config Backup] Restored all config from Discord backup.")
+    print("[Config Backup] Restored products/pipelines from Discord backup.")
     return True
 
 
 async def backup_config_to_discord(reason="manual update"):
     channel = await get_config_backup_channel()
     if not channel:
-        print("[Config Backup] STAFF_CHANNEL_ID is not configured; backup skipped.")
+        print("[Config Backup] BACKUP_CHANNEL_ID/STAFF_CHANNEL_ID is not configured; backup skipped.")
         return
     payload = {
-        "version": 2,
+        "version": 1,
         "updated_at": int(time.time()),
         "reason": reason,
         "products": load_products(),
         "pipelines": load_pipelines(),
-        "weights": load_weights(),
-        "helios_resources": load_helios_resources(),
     }
     content = f"{CONFIG_BACKUP_MARKER}\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
     if len(content) > 2000:
-        # Trop gros pour un message Discord — envoyer en fichier attaché
-        print(f"[Config Backup] Backup too large ({len(content)} chars), sending as file...")
-        try:
-            import io
-            file_data = json.dumps(payload, ensure_ascii=False, indent=2)
-            file = discord.File(io.BytesIO(file_data.encode("utf-8")), filename="config_backup.json")
-            message = await find_config_backup_message()
-            marker_content = f"{CONFIG_BACKUP_MARKER}\n(see attached file)"
-            if message:
-                await message.delete()
-            await channel.send(marker_content, file=file)
-            print(f"[Config Backup] Sent as file ({reason}).")
-        except Exception as e:
-            print(f"[Config Backup] Could not write Discord backup: {e}")
+        print("[Config Backup] Backup is too large for one Discord message; backup skipped.")
         return
     try:
         message = await find_config_backup_message()
         if message:
             await message.edit(content=content)
+            print(f"[Config Backup] Updated Discord backup ({reason}).")
         else:
             await channel.send(content)
-        print(f"[Config Backup] Updated Discord backup ({reason}).")
+            print(f"[Config Backup] Created Discord backup ({reason}).")
     except Exception as e:
         print(f"[Config Backup] Could not write Discord backup: {e}")
 
@@ -425,7 +466,6 @@ def build_specs_embed(weight_data: dict) -> discord.Embed:
     specs_general = weight_data.get("specs_general", "")
     specs_ae = weight_data.get("specs_ae", "")
     specs_win = weight_data.get("specs_win", "")
-    specs_ex = weight_data.get("specs_ex", "")
     version = weight_data.get("version", "")
     author = weight_data.get("author", "")
 
@@ -440,8 +480,6 @@ def build_specs_embed(weight_data: dict) -> discord.Embed:
         embed.add_field(name="AE", value=specs_ae, inline=False)
     if specs_win:
         embed.add_field(name="WIN", value=specs_win, inline=False)
-    if specs_ex:
-        embed.add_field(name="EX", value=specs_ex, inline=False)
 
     if version or author:
         footer_parts = []
@@ -486,12 +524,15 @@ class WeightView(discord.ui.View):
             return
 
         guild = interaction.guild
+        config = get_guild_config(guild.id)
         category = None
-        if TICKET_CATEGORY_ID:
-            category = guild.get_channel(TICKET_CATEGORY_ID)
+        if config.get("ticket_category_id"):
+            category = guild.get_channel(int(config["ticket_category_id"]))
 
-        # Vérifier si l'utilisateur a déjà un ticket ouvert pour ce weight
-        ticket_name = f"ticket-{interaction.user.name.lower().replace(' ', '-')}"
+        # Vérifier si l'utilisateur a déjà un ticket ouvert pour CE weight
+        user_slug = re.sub(r'[^a-z0-9\-]', '-', interaction.user.name.lower())
+        weight_slug = re.sub(r'[^a-z0-9\-]', '-', weight_data.get("name", "weight").lower())
+        ticket_name = f"ticket-{user_slug}-{weight_slug}"[:100]
         existing = discord.utils.get(guild.text_channels, name=ticket_name)
         if existing:
             await interaction.response.send_message(
@@ -547,12 +588,11 @@ class WeightView(discord.ui.View):
         )
 
         # Ping staff si configuré
-        if STAFF_CHANNEL_ID:
-            staff_channel = bot.get_channel(STAFF_CHANNEL_ID)
-            if staff_channel:
-                await staff_channel.send(
-                    f"📬 New purchase ticket for **{weight_name}** by {interaction.user.mention} → {ticket_channel.mention}"
-                )
+        staff_channel = get_guild_channel(guild.id, "staff_channel_id")
+        if staff_channel:
+            await staff_channel.send(
+                f"📬 New purchase ticket for **{weight_name}** by {interaction.user.mention} → {ticket_channel.mention}"
+            )
 
         await interaction.response.send_message(
             f"✅ Your ticket has been created: {ticket_channel.mention}", ephemeral=True
@@ -679,7 +719,7 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
             style=discord.TextStyle.paragraph,
             max_length=800,
             required=False,
-            placeholder="image: https://...\nplatforms: ae,win,ex\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
+            placeholder="image: https://...\nplatforms: ae,win\nversion: v1.46.3\nauthor: swt\nmodel: XyCubValorantV2",
             default=image_default,
         )
 
@@ -725,13 +765,12 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
             "specs_general": "",
             "specs_ae": "",
             "specs_win": "",
-            "specs_ex": "",
         }
 
         weights = load_weights()
         # Conserver les specs existantes si on édite
         if self.weight_id and self.weight_id in weights:
-            for key in ["specs_general", "specs_ae", "specs_win", "specs_ex"]:
+            for key in ["specs_general", "specs_ae", "specs_win"]:
                 weight_data[key] = weights[self.weight_id].get(key, "")
 
         if not self.weight_id:
@@ -743,7 +782,6 @@ class WeightAddModal(discord.ui.Modal, title="Add / Edit Weight"):
 
         weights[weight_id] = weight_data
         save_weights(weights)
-        asyncio.create_task(backup_config_to_discord("weight saved"))
 
         embed = build_weight_embed(weight_data)
         view = WeightView(weight_id)
@@ -786,19 +824,9 @@ class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
             placeholder="• Target Classes: 2,0\n• Confidence: 50%\n...",
             default=existing.get("specs_win", "") if existing else "",
         )
-        self.specs_ex = discord.ui.TextInput(
-            label="EX specs",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            required=False,
-            placeholder="• ...",
-            default=existing.get("specs_ex", "") if existing else "",
-        )
-
         self.add_item(self.specs_general)
         self.add_item(self.specs_ae)
         self.add_item(self.specs_win)
-        self.add_item(self.specs_ex)
 
     async def on_submit(self, interaction: discord.Interaction):
         weights = load_weights()
@@ -809,9 +837,7 @@ class WeightSpecsModal(discord.ui.Modal, title="Edit Specs"):
         weights[self.weight_id]["specs_general"] = self.specs_general.value.strip()
         weights[self.weight_id]["specs_ae"] = self.specs_ae.value.strip()
         weights[self.weight_id]["specs_win"] = self.specs_win.value.strip()
-        weights[self.weight_id]["specs_ex"] = self.specs_ex.value.strip()
         save_weights(weights)
-        asyncio.create_task(backup_config_to_discord("specs updated"))
 
         embed = build_specs_embed(weights[self.weight_id])
         await interaction.response.send_message(
@@ -896,7 +922,6 @@ async def weightdelete_cmd(interaction: discord.Interaction, weight_id: str):
     del weights[weight_id]
     save_weights(weights)
     await interaction.response.send_message(f"🗑️ Weight **{name}** deleted.", ephemeral=True)
-    await backup_config_to_discord("weightdelete")
 
 
 @tree.command(name="weightlist", description="Lister tous les weights enregistrés")
@@ -924,10 +949,7 @@ async def weightlist_cmd(interaction: discord.Interaction):
 
 class ContactOnlyModal(discord.ui.Modal):
     def __init__(self, model_name: str, platform: str):
-        if platform == "enginex":
-            label = "Your email (for EngineX)"
-        else:
-            label = "Your Discord ID (for Winsight)"
+        label = "Your Discord ID"
         super().__init__(title="Order Details")
         self.model_name = model_name
         self.platform = platform
@@ -974,6 +996,7 @@ class ContactOnlyModal(discord.ui.Modal):
             model=self.model_name,
             platform=self.platform,
             stripe_session_id=checkout_session.id,
+            guild_id=interaction.guild_id,
         )
 
         embed = discord.Embed(
@@ -1092,18 +1115,82 @@ async def on_ready():
         bot.add_view(WeightView(weight_id))
 
     print(f"✅ Bot connecté en tant que {bot.user} (ID: {bot.user.id})")
+    print(f"📡 Présent sur {len(bot.guilds)} serveur(s) : {', '.join(g.name for g in bot.guilds)}")
 
-    if ORDER_PANEL_CHANNEL_ID:
-        channel = bot.get_channel(ORDER_PANEL_CHANNEL_ID)
-        if channel:
-            embed = discord.Embed(title=ORDER_EMBED_TITLE, description=ORDER_EMBED_DESCRIPTION, color=EMBED_COLOR)
+    # Panneau de commande : un par serveur qui l'a configuré
+    for guild in bot.guilds:
+        channel = get_guild_channel(guild.id, "order_panel_channel_id")
+        if not channel or channel.guild.id != guild.id:
+            continue
+        embed = discord.Embed(title=ORDER_EMBED_TITLE, description=ORDER_EMBED_DESCRIPTION, color=EMBED_COLOR)
+        try:
             await channel.send(embed=embed, view=OrderStartView())
-            print(f"📌 Order panel posted in #{channel.name}")
+            print(f"📌 Order panel posted in {guild.name}/#{channel.name}")
+        except Exception as e:
+            print(f"[Order Panel] Could not post in {guild.name}: {e}")
 
 
 # ─────────────────────────────────────────────
 #  COMMANDES ADMIN EXISTANTES
 # ─────────────────────────────────────────────
+
+@tree.command(name="setup", description="Configurer les salons du bot pour CE serveur")
+@app_commands.describe(
+    staff_channel="Salon où le bot poste les rapports de livraison et les tickets",
+    order_panel_channel="Salon où poster le panneau de commande au démarrage",
+    vouch_channel="Salon où poster les avis clients",
+    ticket_category="Catégorie dans laquelle créer les salons de ticket",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_cmd(
+    interaction: discord.Interaction,
+    staff_channel: discord.TextChannel = None,
+    order_panel_channel: discord.TextChannel = None,
+    vouch_channel: discord.TextChannel = None,
+    ticket_category: discord.CategoryChannel = None,
+):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Cette commande doit être utilisée dans un serveur.", ephemeral=True)
+        return
+
+    updates = {}
+    if staff_channel:
+        updates["staff_channel_id"] = staff_channel.id
+    if order_panel_channel:
+        updates["order_panel_channel_id"] = order_panel_channel.id
+    if vouch_channel:
+        updates["vouch_channel_id"] = vouch_channel.id
+    if ticket_category:
+        updates["ticket_category_id"] = ticket_category.id
+
+    if updates:
+        set_guild_config(interaction.guild.id, **updates)
+
+    config = get_guild_config(interaction.guild.id)
+
+    def show(key, is_category=False):
+        value = config.get(key)
+        if not value:
+            return "*non configuré*"
+        channel = interaction.guild.get_channel(int(value))
+        if channel:
+            return channel.mention if not is_category else f"**{channel.name}**"
+        return f"`{value}` *(introuvable sur ce serveur)*"
+
+    embed = discord.Embed(
+        title=f"⚙️ Configuration — {interaction.guild.name}",
+        description="Relance `/setup` avec les options que tu veux changer." if updates
+        else "Aucune modification. Passe des salons en options pour les définir.",
+        color=EMBED_COLOR,
+    )
+    embed.add_field(name="Staff", value=show("staff_channel_id"), inline=False)
+    embed.add_field(name="Panneau de commande", value=show("order_panel_channel_id"), inline=False)
+    embed.add_field(name="Avis (vouch)", value=show("vouch_channel_id"), inline=False)
+    embed.add_field(name="Catégorie tickets", value=show("ticket_category_id", True), inline=False)
+    embed.set_footer(text="Les weights, produits et pipelines sont partagés entre tous les serveurs.")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 @tree.command(name="order", description="Poster le panneau de commande Stripe")
 @app_commands.checks.has_permissions(administrator=True)
@@ -1115,7 +1202,6 @@ async def order_cmd(interaction: discord.Interaction):
 
 platform_choices = [
     app_commands.Choice(name="Winsight", value="winsight"),
-    app_commands.Choice(name="EngineX", value="enginex"),
     app_commands.Choice(name="Helios", value="helios"),
 ]
 
@@ -1197,222 +1283,263 @@ async def productlist_cmd(interaction: discord.Interaction, public: bool = False
 
 
 # ─────────────────────────────────────────────
-#  AUTOMATISATION WINSIGHT (Playwright)
+#  CLIENT API WINSIGHT
+# ─────────────────────────────────────────────
+#
+#  Le portail Winsight expose une API REST — la même que son propre front-end
+#  React consomme. On tape dessus directement plutôt que de piloter un
+#  navigateur : pas de Chromium à installer, pas de sélecteurs DOM qui cassent
+#  au prochain déploiement du site, et une vraie erreur exploitable au lieu
+#  d'un « j'ai cliqué quelque part ».
+
+WINSIGHT_API_PREFIX = "/api/n4f7a2c6d1e8x5b3"
+WINSIGHT_WEIGHTS_TTL = 30  # secondes de cache sur la liste des weights
+
+
+def _winsight_api_base() -> str:
+    """Origine du portail (https://host), déduite de WINSIGHT_URL."""
+    explicit = os.environ.get("WINSIGHT_API_BASE", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    parsed = urlparse(WINSIGHT_URL)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def normalize_weight_name(name: str) -> str:
+    """Normalise pour comparaison : casse, extension .onnx, `_`, `-` et espaces."""
+    name = (name or "").strip().lower()
+    if name.endswith(".onnx"):
+        name = name[:-5]
+    return re.sub(r"[_\-\s]", "", name)
+
+
+class WinsightError(Exception):
+    """Erreur métier renvoyée par le portail (message déjà lisible)."""
+
+
+class WinsightClient:
+    """
+    Client HTTP du portail Winsight : session persistante (cookie), login à la
+    demande, et re-login automatique si la session expire.
+    """
+
+    def __init__(self):
+        self._session = None
+        self._lock = asyncio.Lock()
+        self._authenticated = False
+        self._weights = None
+        self._weights_at = 0.0
+
+    # ── plomberie ────────────────────────────
+
+    def _url(self, path: str) -> str:
+        return f"{_winsight_api_base()}{WINSIGHT_API_PREFIX}{path}"
+
+    async def _get_session(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                cookie_jar=aiohttp.CookieJar(),
+            )
+            self._authenticated = False
+        return self._session
+
+    async def _login(self):
+        if not WINSIGHT_USERNAME or not WINSIGHT_PASSWORD:
+            raise WinsightError("WINSIGHT_USERNAME / WINSIGHT_PASSWORD ne sont pas configurés.")
+        session = await self._get_session()
+        async with session.post(
+            self._url("/login"),
+            json={"username": WINSIGHT_USERNAME, "password": WINSIGHT_PASSWORD},
+        ) as resp:
+            body = await _json_or_none(resp)
+            if resp.status == 200:
+                print("[Winsight] Session ouverte.")
+                self._weights = None  # nouvelle session → cache invalidé
+                return
+            message = ""
+            if isinstance(body, dict):
+                message = body.get("message") or body.get("error") or ""
+            raise WinsightError(message or f"Login refusé (HTTP {resp.status}).")
+
+    async def _ensure_auth(self):
+        if self._authenticated:
+            return
+        async with self._lock:
+            if self._authenticated:
+                return
+            await self._login()
+            self._authenticated = True
+
+    async def _request(self, method: str, path: str, json_body=None, _retry: bool = True):
+        await self._ensure_auth()
+        session = await self._get_session()
+        async with session.request(method, self._url(path), json=json_body) as resp:
+            if resp.status in (401, 403) and _retry:
+                # Session expirée côté serveur : on se reconnecte une fois.
+                self._authenticated = False
+                return await self._request(method, path, json_body, _retry=False)
+            body = await _json_or_none(resp)
+            if resp.status >= 400:
+                message = ""
+                if isinstance(body, dict):
+                    message = body.get("message") or body.get("error") or ""
+                raise WinsightError(message or f"HTTP {resp.status}")
+            return body
+
+    # ── weights ──────────────────────────────
+
+    async def list_weights(self, force: bool = False) -> list:
+        now = time.time()
+        if not force and self._weights is not None and now - self._weights_at < WINSIGHT_WEIGHTS_TTL:
+            return self._weights
+        data = await self._request("GET", "/weights")
+        self._weights = data if isinstance(data, list) else []
+        self._weights_at = now
+        return self._weights
+
+    async def find_weights(self, keyword: str) -> list:
+        """Toutes les weights dont le nom contient `keyword`."""
+        target = normalize_weight_name(keyword)
+        if not target:
+            return []
+        return [
+            w for w in await self.list_weights()
+            if target in normalize_weight_name(w.get("fileName", ""))
+        ]
+
+    async def find_weight(self, model_name: str) -> dict:
+        """
+        Une seule weight : correspondance exacte en priorité, sinon l'unique
+        correspondance partielle. On refuse plutôt que de deviner — donner le
+        mauvais modèle à un client payant est pire qu'une erreur claire.
+        """
+        target = normalize_weight_name(model_name)
+        weights = await self.list_weights()
+
+        exact = [w for w in weights if normalize_weight_name(w.get("fileName", "")) == target]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise WinsightError(f"« {model_name} » correspond à {len(exact)} weights portant le même nom.")
+
+        partial = [
+            w for w in weights
+            if target and target in normalize_weight_name(w.get("fileName", ""))
+        ]
+        if len(partial) == 1:
+            return partial[0]
+        if not partial:
+            raise WinsightError(f"« {model_name} » introuvable sur Winsight.")
+        names = ", ".join(w.get("fileName", "?") for w in partial[:5])
+        raise WinsightError(f"« {model_name} » est ambigu ({len(partial)} correspondances : {names}).")
+
+    # ── partages ─────────────────────────────
+
+    async def list_shares(self, weight_id) -> list:
+        data = await self._request("GET", f"/weights/{weight_id}/shares")
+        return data if isinstance(data, list) else []
+
+    async def has_share(self, weight_id, username: str) -> bool:
+        wanted = str(username).strip().lower()
+        return any(
+            str(s.get("sharedWithUsername", "")).strip().lower() == wanted
+            for s in await self.list_shares(weight_id)
+        )
+
+    async def share(self, weight_id, username: str):
+        await self._request(
+            "POST", f"/weights/{weight_id}/shares", {"shareUsername": str(username).strip()}
+        )
+
+    async def unshare(self, weight_id, username: str):
+        await self._request(
+            "DELETE", f"/weights/{weight_id}/shares/{quote(str(username).strip(), safe='')}"
+        )
+
+
+async def _json_or_none(resp):
+    try:
+        return await resp.json(content_type=None)
+    except Exception:
+        return None
+
+
+winsight = WinsightClient()
+
+
+# ─────────────────────────────────────────────
+#  OPÉRATIONS WINSIGHT (grant / check / revoke)
 # ─────────────────────────────────────────────
 
-async def _winsight_login(page) -> bool:
-    """Ouvre Winsight et se connecte si nécessaire. Retourne True si connecté."""
-    await page.goto(WINSIGHT_URL, timeout=30000)
-    await page.wait_for_load_state("networkidle", timeout=30000)
-    login_input = await page.query_selector("input[type='text']")
-    if login_input:
-        await page.fill("input[type='text']", WINSIGHT_USERNAME)
-        await page.fill("input[type='password']", WINSIGHT_PASSWORD)
-        clicked = await page.evaluate("""
-            () => {
-                const buttons = document.querySelectorAll("button");
-                for (const btn of buttons) {
-                    if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
-                }
-                return false;
-            }
-        """)
-        if not clicked:
-            await page.click("text=SIGN IN", timeout=10000)
-        await asyncio.sleep(3)
-        await page.wait_for_load_state("networkidle", timeout=30000)
-    return True
-
-
-async def _winsight_grant_one(page, discord_id: str, model_name: str) -> tuple[bool, str]:
-    """Grant un seul modèle sur une page déjà connectée. Recherche insensible à la casse."""
-    match_info = await page.evaluate(f"""
-        () => {{
-            // Reset previous markers
-            document.querySelectorAll("[data-bot-target-input]").forEach(el => el.removeAttribute("data-bot-target-input"));
-            document.querySelectorAll("[data-bot-target-button]").forEach(el => el.removeAttribute("data-bot-target-button"));
-
-            const modelName = "{model_name}".toLowerCase();
-            const allElements = document.querySelectorAll("*");
-            let matchEl = null;
-            for (const el of allElements) {{
-                let directText = "";
-                for (const node of el.childNodes) {{
-                    if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
-                }}
-                // Comparaison insensible à la casse ET aux underscores/tirets
-                const normalized = directText.toLowerCase().replace(/[_\\-]/g, "");
-                const searchNorm = modelName.replace(/[_\\-]/g, "");
-                if (normalized.includes(searchNorm)) {{ matchEl = el; break; }}
-            }}
-            if (!matchEl) return {{ status: "not_found" }};
-            let parent = matchEl;
-            for (let i = 0; i < 12; i++) {{
-                parent = parent.parentElement;
-                if (!parent) break;
-                const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']");
-                const buttons = parent.querySelectorAll("button");
-                let shareBtn = null;
-                for (const btn of buttons) {{
-                    if (btn.textContent.toUpperCase().includes("SHARE")) {{ shareBtn = btn; break; }}
-                }}
-                if (input && shareBtn) {{
-                    input.setAttribute("data-bot-target-input", "true");
-                    shareBtn.setAttribute("data-bot-target-button", "true");
-                    return {{ status: "found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
-                }}
-            }}
-            return {{ status: "container_not_found", matchedText: matchEl.textContent.trim().substring(0, 100) }};
-        }}
-    """)
-
-    if match_info["status"] == "found":
-        input_locator = page.locator("[data-bot-target-input='true']")
-        await input_locator.click()
-        await input_locator.fill("")
-        await input_locator.type(discord_id, delay=30)
-        await asyncio.sleep(0.5)
-        share_button = page.locator("[data-bot-target-button='true']")
-        await share_button.click()
-        await asyncio.sleep(1.5)
-        return True, f"✓ {model_name}"
-    elif match_info["status"] == "container_not_found":
-        return False, f"✗ {model_name} (trouvé mais pas d'input/share button)"
-    else:
-        return False, f"✗ {model_name} (introuvable sur la page)"
+async def _winsight_share_one(weight: dict, username: str) -> tuple[bool, str]:
+    """Partage une weight déjà résolue. Idempotent."""
+    name = weight.get("fileName", f"#{weight.get('id')}")
+    try:
+        if await winsight.has_share(weight["id"], username):
+            return True, f"✓ {name} (déjà partagé)"
+        await winsight.share(weight["id"], username)
+        return True, f"✓ {name}"
+    except Exception as e:
+        return False, f"✗ {name} — {e}"
 
 
 async def winsight_grant(discord_id: str, model_name: str) -> tuple[bool, str]:
-    """Grant un seul modèle (ouvre et ferme son propre browser)."""
+    """Partage un seul modèle avec un client."""
     print(f"[Winsight] Grant: discord_id={discord_id}, model={model_name}")
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await _winsight_login(page)
-            success, msg = await _winsight_grant_one(page, discord_id, model_name)
-            await browser.close()
-            if success:
-                return True, f"Access granted to {discord_id} for {model_name} on Winsight."
-            return False, msg
+        weight = await winsight.find_weight(model_name)
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        return False, f"✗ {e}"
 
-
-async def _winsight_scrape_matching(page, keyword: str) -> list[str]:
-    """
-    Scrape la page Winsight connectée et retourne les noms exacts de toutes les
-    weights dont le nom contient `keyword` (insensible à la casse).
-    Cherche les éléments qui ont un input 'username/customer' + bouton 'SHARE' à proximité.
-    """
-    found_names = await page.evaluate(f"""
-        () => {{
-            const keyword = "{keyword}".toLowerCase();
-            const results = [];
-
-            // Cherche tous les éléments dont le texte direct contient le keyword
-            const allElements = document.querySelectorAll("*");
-            for (const el of allElements) {{
-                let directText = "";
-                for (const node of el.childNodes) {{
-                    if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
-                }}
-                const normalized = directText.toLowerCase().replace(/[_\\-\\s]/g, "");
-                const keyNorm   = keyword.replace(/[_\\-\\s]/g, "");
-                if (!normalized.includes(keyNorm)) continue;
-
-                // Vérifie que ce nœud est bien la "card" d'une weight
-                // (un parent proche contient un input username + bouton SHARE)
-                let parent = el;
-                for (let i = 0; i < 12; i++) {{
-                    parent = parent.parentElement;
-                    if (!parent) break;
-                    const input = parent.querySelector(
-                        "input[placeholder*='username'], input[placeholder*='customer'], input[placeholder*='Username']"
-                    );
-                    const buttons = parent.querySelectorAll("button");
-                    let hasShare = false;
-                    for (const btn of buttons) {{
-                        if (btn.textContent.toUpperCase().includes("SHARE")) {{ hasShare = true; break; }}
-                    }}
-                    if (input && hasShare) {{
-                        const name = directText.trim();
-                        if (name && !results.includes(name)) results.push(name);
-                        break;
-                    }}
-                }}
-            }}
-            return results;
-        }}
-    """)
-    print(f"[Winsight Scrape] keyword='{keyword}' → found: {found_names}")
-    return found_names
+    ok, msg = await _winsight_share_one(weight, discord_id)
+    if ok:
+        return True, f"Access granted to {discord_id} for {weight.get('fileName', model_name)} on Winsight."
+    return False, msg
 
 
 async def winsight_grant_all_dynamic(discord_id: str, keyword: str) -> tuple[int, int, list[str]]:
     """
-    Ouvre Winsight, scrape dynamiquement toutes les weights dont le nom contient
-    `keyword`, puis les grant toutes en une seule session browser.
-    Retourne (nb_success, nb_fail, detail_lines).
+    Partage toutes les weights dont le nom contient `keyword` (ex: « Valorant »
+    → toutes les versions). Retourne (nb_ok, nb_fail, détails).
     """
-    print(f"[Winsight] Grant ALL dynamic: discord_id={discord_id}, keyword='{keyword}'")
+    print(f"[Winsight] Grant ALL: discord_id={discord_id}, keyword='{keyword}'")
+    try:
+        matches = await winsight.find_weights(keyword)
+    except Exception as e:
+        return 0, 1, [f"✗ Erreur API Winsight : {e}"]
+
+    if not matches:
+        return 0, 0, [f"⚠️ Aucune weight contenant « {keyword} » trouvée sur Winsight."]
+
     successes = 0
     failures = 0
     details = []
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await _winsight_login(page)
-
-            # Scrape les noms réels sur la page
-            matching_names = await _winsight_scrape_matching(page, keyword)
-
-            if not matching_names:
-                await browser.close()
-                return 0, 0, [f"⚠️ Aucune weight contenant « {keyword} » trouvée sur Winsight."]
-
-            # Grant chacune dans la même session
-            for name in matching_names:
-                ok, msg = await _winsight_grant_one(page, discord_id, name)
-                if ok:
-                    successes += 1
-                else:
-                    failures += 1
-                details.append(msg)
-
-            await browser.close()
-    except Exception as e:
-        details.append(f"Browser error: {str(e)}")
-        failures = max(1, failures)
+    for weight in matches:
+        ok, msg = await _winsight_share_one(weight, discord_id)
+        successes += 1 if ok else 0
+        failures += 0 if ok else 1
+        details.append(msg)
     return successes, failures, details
 
 
 async def winsight_grant_all(discord_id: str, model_names: list[str]) -> tuple[int, int, list[str]]:
-    """
-    Grant une liste fixe de modèles en une seule session browser.
-    Utilisé pour les grants via Stripe (liste connue à l'avance).
-    """
+    """Partage une liste fixe de modèles (noms connus à l'avance)."""
     print(f"[Winsight] Grant ALL (fixed list): discord_id={discord_id}, models={model_names}")
     successes = 0
     failures = 0
     details = []
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await _winsight_login(page)
-            for model_name in model_names:
-                ok, msg = await _winsight_grant_one(page, discord_id, model_name)
-                if ok:
-                    successes += 1
-                else:
-                    failures += 1
-                details.append(msg)
-            await browser.close()
-    except Exception as e:
-        details.append(f"Browser error: {str(e)}")
-        failures += len(model_names) - successes
+    for model_name in model_names:
+        try:
+            weight = await winsight.find_weight(model_name)
+        except Exception as e:
+            failures += 1
+            details.append(f"✗ {model_name} — {e}")
+            continue
+        ok, msg = await _winsight_share_one(weight, discord_id)
+        successes += 1 if ok else 0
+        failures += 0 if ok else 1
+        details.append(msg)
     return successes, failures, details
 
 
@@ -1423,169 +1550,83 @@ async def winsight_grant_pipeline(discord_id: str, pipeline_site_name: str) -> t
     return False, message
 
 
-async def enginex_grant(email: str, model_name: str) -> tuple[bool, str]:
-    print(f"[EngineX] Starting grant for email={email}, model={model_name}")
+async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
+    """Vérifie si un client figure dans les partages d'une weight."""
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(ENGINEX_LOGIN_URL, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await page.locator("input[type='email'], input[name='email']").first.fill(ENGINEX_USERNAME)
-            await page.locator("input[type='password']").first.fill(ENGINEX_PASSWORD)
-            clicked = await page.evaluate("""
-                () => {
-                    const buttons = document.querySelectorAll("button");
-                    for (const btn of buttons) {
-                        if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
-                    }
-                    return false;
-                }
-            """)
-            if not clicked:
-                await page.click("text=Sign in", timeout=10000)
-            await asyncio.sleep(3)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await page.goto(ENGINEX_ENTITLEMENTS_URL, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-
-            grant_clicked = await page.evaluate("""
-                () => {
-                    const buttons = document.querySelectorAll("button");
-                    for (const btn of buttons) {
-                        if (btn.textContent.toUpperCase().includes("GRANT ACCESS")) { btn.click(); return true; }
-                    }
-                    return false;
-                }
-            """)
-            if not grant_clicked:
-                await browser.close()
-                return False, "Could not find 'Grant Access' button."
-
-            await asyncio.sleep(1)
-            search_input = page.locator("input[placeholder*='email'], input[placeholder*='Discord'], input[placeholder*='username']").first
-            await search_input.click()
-            await search_input.fill("")
-            await search_input.type(email, delay=30)
-            await asyncio.sleep(1.5)
-
-            result_clicked = False
-            try:
-                result_locator = page.locator("div[style*='cursor: pointer']").first
-                await result_locator.click(timeout=5000)
-                result_clicked = True
-            except Exception:
-                try:
-                    result_locator = page.locator(f"*:not(input):has-text('{email}')").last
-                    parent_locator = result_locator.locator("xpath=..")
-                    await parent_locator.click(timeout=5000)
-                    result_clicked = True
-                except Exception:
-                    pass
-
-            if not result_clicked:
-                await browser.close()
-                return False, f"Could not find user matching email '{email}'."
-
-            await asyncio.sleep(0.8)
-            model_label = await page.evaluate(f"""
-                () => {{
-                    const modelName = "{model_name}".toLowerCase();
-                    const selects = document.querySelectorAll("select");
-                    for (const select of selects) {{
-                        for (const option of select.options) {{
-                            if (option.textContent.toLowerCase().includes(modelName)) return option.textContent;
-                        }}
-                    }}
-                    return null;
-                }}
-            """)
-
-            model_selected = False
-            if model_label:
-                try:
-                    await page.locator("select").first.select_option(label=model_label)
-                    model_selected = True
-                except Exception:
-                    pass
-
-            if not model_selected:
-                await browser.close()
-                return False, f"Could not find model '{model_name}' in dropdown."
-
-            await asyncio.sleep(0.5)
-            final_clicked = await page.evaluate("""
-                () => {
-                    const buttons = document.querySelectorAll("button");
-                    for (const btn of buttons) {
-                        if (btn.textContent.trim().toUpperCase() === "GRANT ACCESS") { btn.click(); return true; }
-                    }
-                    return false;
-                }
-            """)
-            await asyncio.sleep(2)
-            modal_still_open = await page.evaluate("""
-                () => {
-                    const body = document.body.innerText;
-                    return body.includes("Grant Model Access") && body.includes("Select a user and a model");
-                }
-            """)
-            await browser.close()
-
-            if final_clicked and not modal_still_open:
-                return True, f"Access granted to {email} for {model_name} on EngineX."
-            elif final_clicked:
-                return False, "Clicked Grant Access but modal is still open."
-            else:
-                return False, "Could not click final 'Grant Access' button."
+        weight = await winsight.find_weight(model_name)
+        name = weight.get("fileName", model_name)
+        if await winsight.has_share(weight["id"], discord_id):
+            return True, f"✅ {discord_id} a accès à **{name}**."
+        return False, f"❌ {discord_id} n'a PAS accès à **{name}**."
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        return False, f"⚠️ {e}"
 
+
+async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
+    """Retire l'accès d'un client à une weight, puis vérifie que c'est effectif."""
+    print(f"[Winsight] Revoke: discord_id={discord_id}, model={model_name}")
+    try:
+        weight = await winsight.find_weight(model_name)
+    except Exception as e:
+        return False, f"✗ {e}"
+
+    name = weight.get("fileName", model_name)
+    try:
+        if not await winsight.has_share(weight["id"], discord_id):
+            return False, f"⚠️ {discord_id} n'a pas accès à **{name}**."
+        await winsight.unshare(weight["id"], discord_id)
+        # On relit la liste : c'est la seule preuve que le retrait a bien eu lieu.
+        if await winsight.has_share(weight["id"], discord_id):
+            return False, f"✗ {name} (le partage est toujours actif après suppression)"
+        return True, f"✓ {name} — accès retiré à {discord_id}"
+    except Exception as e:
+        return False, f"✗ {name} — {e}"
+
+
+# ─────────────────────────────────────────────
+#  HELIOS / INPUTSENSE
+# ─────────────────────────────────────────────
 
 async def helios_grant(discord_id: str, resource_id: str = None, notes: str = None) -> tuple[bool, str]:
-    """Grant access via Helios/InputSense API pour un resource_id donné."""
+    """Grant access via Helios/InputSense API."""
+    rid = resource_id or HELIOS_RESOURCE_ID
     if not HELIOS_API_KEY:
         return False, "❌ HELIOS_API_KEY not configured."
-    if not resource_id:
-        return False, "❌ No Helios resource ID provided."
 
-    url = f"{HELIOS_API_URL}?route=items/{resource_id}/authorized-users"
+    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users"
     headers = {
         "Authorization": f"Bearer {HELIOS_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
         "discord_id": str(discord_id),
-        "notes": notes or "Granted via bot",
+        "notes": notes or f"Granted via bot",
         "expires_at": None,
     }
     print(f"[Helios] Grant: POST {url} discord_id={discord_id}")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                raw = await resp.text()
-                print(f"[Helios] Grant response: {resp.status} {raw[:300]}")
-                try:
-                    body = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    return False, f"✗ Helios ({resource_id[:8]}...): non-JSON response: {raw[:100]}"
-                if isinstance(body, dict) and body.get("success"):
-                    return True, f"✓ Helios ({resource_id[:8]}...)"
+                status = resp.status
+                body = await resp.json(content_type=None)
+                print(f"[Helios] Response: {status} {body}")
+                if body.get("success"):
+                    return True, f"✅ Access granted to `{discord_id}` on Helios."
                 else:
-                    error = body.get("error", {}) if isinstance(body, dict) else {}
-                    return False, f"✗ Helios ({resource_id[:8]}...): {error.get('code', 'unknown')} — {error.get('message', raw[:100])}"
+                    error = body.get("error", {})
+                    return False, f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
     except Exception as e:
-        return False, f"✗ Helios error: {str(e)}"
+        print(f"[Helios] EXCEPTION: {e}")
+        return False, f"Error: {str(e)}"
 
 
 async def helios_revoke(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
     """Revoke access via Helios/InputSense API."""
+    rid = resource_id or HELIOS_RESOURCE_ID
     if not HELIOS_API_KEY:
         return False, "❌ HELIOS_API_KEY not configured."
-    if not resource_id:
-        return False, "❌ No Helios resource ID provided."
 
-    url = f"{HELIOS_API_URL}?route=items/{resource_id}/authorized-users/{discord_id}/revoke"
+    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users/{discord_id}/revoke"
     headers = {
         "Authorization": f"Bearer {HELIOS_API_KEY}",
         "Content-Type": "application/json",
@@ -1594,86 +1635,42 @@ async def helios_revoke(discord_id: str, resource_id: str = None) -> tuple[bool,
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json={}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                raw = await resp.text()
-                print(f"[Helios] Revoke response: {resp.status} {raw[:300]}")
-                try:
-                    body = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    return False, f"✗ Helios ({resource_id[:8]}...): non-JSON response: {raw[:100]}"
-                if isinstance(body, dict) and body.get("success"):
-                    return True, f"✓ Helios ({resource_id[:8]}...)"
+                status = resp.status
+                body = await resp.json(content_type=None)
+                print(f"[Helios] Response: {status} {body}")
+                if body.get("success"):
+                    return True, f"✅ Access revoked for `{discord_id}` on Helios."
                 else:
-                    error = body.get("error", {}) if isinstance(body, dict) else {}
-                    return False, f"✗ Helios ({resource_id[:8]}...): {error.get('code', 'unknown')} — {error.get('message', raw[:100])}"
+                    error = body.get("error", {})
+                    return False, f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
     except Exception as e:
-        return False, f"✗ Helios error: {str(e)}"
+        print(f"[Helios] EXCEPTION: {e}")
+        return False, f"Error: {str(e)}"
 
 
 async def helios_check(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
     """Check if a user has access via Helios/InputSense API."""
+    rid = resource_id or HELIOS_RESOURCE_ID
     if not HELIOS_API_KEY:
         return False, "❌ HELIOS_API_KEY not configured."
-    if not resource_id:
-        return False, "❌ No Helios resource ID provided."
 
-    url = f"{HELIOS_API_URL}?route=items/{resource_id}/authorized-users&limit=200&offset=0"
-    headers = {"Authorization": f"Bearer {HELIOS_API_KEY}"}
+    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users&limit=200&offset=0"
+    headers = {
+        "Authorization": f"Bearer {HELIOS_API_KEY}",
+    }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                raw = await resp.text()
-                try:
-                    body = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    return False, f"❌ Helios non-JSON response: {raw[:100]}"
-                if not isinstance(body, dict) or not body.get("success"):
-                    return False, f"❌ Helios API error: {raw[:200]}"
+                body = await resp.json(content_type=None)
+                if not body.get("success"):
+                    return False, f"❌ Helios API error: {body}"
                 users = body.get("data", [])
                 for user in users:
                     if str(user.get("discord_id", "")) == str(discord_id):
-                        return True, f"✅ `{discord_id}` has access ({resource_id[:8]}...)"
-                return False, f"❌ `{discord_id}` does NOT have access ({resource_id[:8]}...)"
+                        return True, f"✅ `{discord_id}` has access on Helios."
+                return False, f"❌ `{discord_id}` does NOT have access on Helios."
     except Exception as e:
         return False, f"Error: {str(e)}"
-
-
-async def helios_grant_group(discord_id: str, group_name: str) -> tuple[int, int, list[str]]:
-    """Grant access sur tous les resource IDs Helios associés au groupe."""
-    helios_res = load_helios_resources()
-    # Cherche toutes les entrées qui matchent le group_name
-    matching = {name: rid for name, rid in helios_res.items() if group_name.lower() in name.lower()}
-    if not matching:
-        return 0, 0, [f"⚠️ Aucune ressource Helios enregistrée pour « {group_name} ». Utilise `/sethelios`."]
-    successes = 0
-    failures = 0
-    details = []
-    for name, rid in matching.items():
-        ok, msg = await helios_grant(discord_id, rid)
-        if ok:
-            successes += 1
-        else:
-            failures += 1
-        details.append(f"{msg} ({name})")
-    return successes, failures, details
-
-
-async def helios_revoke_group(discord_id: str, group_name: str) -> tuple[int, int, list[str]]:
-    """Revoke access sur tous les resource IDs Helios associés au groupe."""
-    helios_res = load_helios_resources()
-    matching = {name: rid for name, rid in helios_res.items() if group_name.lower() in name.lower()}
-    if not matching:
-        return 0, 0, [f"⚠️ Aucune ressource Helios enregistrée pour « {group_name} »."]
-    successes = 0
-    failures = 0
-    details = []
-    for name, rid in matching.items():
-        ok, msg = await helios_revoke(discord_id, rid)
-        if ok:
-            successes += 1
-        else:
-            failures += 1
-        details.append(f"{msg} ({name})")
-    return successes, failures, details
 
 
 async def process_paid_order(order_id: str):
@@ -1683,33 +1680,25 @@ async def process_paid_order(order_id: str):
     update_order(order_id, status="processing")
     platform = order.get("platform", "winsight")
 
-    if platform == "enginex":
-        success, message = await enginex_grant(order["buyer_contact"], order["model"])
-    elif platform == "helios":
-        helios_res = load_helios_resources()
-        group = get_game_group(order["model"])
-        rid = helios_res.get(group) or helios_res.get(order["model"])
-        if rid:
-            success, message = await helios_grant(order["buyer_contact"], rid)
-        else:
-            success, message = False, "No Helios resource ID configured for this model."
+    if platform == "helios":
+        success, message = await helios_grant(order["buyer_contact"])
     else:
         success, message = await winsight_grant(order["buyer_contact"], order["model"])
 
     update_order(order_id, status="delivered" if success else "failed")
 
-    if STAFF_CHANNEL_ID:
-        channel = bot.get_channel(STAFF_CHANNEL_ID)
-        if channel:
-            color = 0x57F287 if success else 0xED4245
-            title = "✅ Order Delivered Automatically" if success else "❌ Auto-Delivery Failed"
-            embed = discord.Embed(title=title, color=color)
-            embed.add_field(name="Buyer", value=f"<@{order['buyer_id']}>", inline=True)
-            embed.add_field(name="Contact", value=order["buyer_contact"], inline=True)
-            embed.add_field(name="Model", value=get_display_name(order["model"]), inline=False)
-            embed.add_field(name="Details", value=message, inline=False)
-            embed.set_footer(text=f"Order ID: {order_id}")
-            await channel.send(embed=embed)
+    # Rapport dans le salon staff du serveur d'où vient la commande
+    channel = get_guild_channel(order.get("guild_id"), "staff_channel_id")
+    if channel:
+        color = 0x57F287 if success else 0xED4245
+        title = "✅ Order Delivered Automatically" if success else "❌ Auto-Delivery Failed"
+        embed = discord.Embed(title=title, color=color)
+        embed.add_field(name="Buyer", value=f"<@{order['buyer_id']}>", inline=True)
+        embed.add_field(name="Contact", value=order["buyer_contact"], inline=True)
+        embed.add_field(name="Model", value=get_display_name(order["model"]), inline=False)
+        embed.add_field(name="Details", value=message, inline=False)
+        embed.set_footer(text=f"Order ID: {order_id}")
+        await channel.send(embed=embed)
 
     buyer = bot.get_user(order["buyer_id"])
     if buyer:
@@ -1725,170 +1714,6 @@ async def process_paid_order(order_id: str):
                 )
         except discord.Forbidden:
             pass
-
-
-# ─────────────────────────────────────────────
-#  VÉRIFICATION / REVOKE D'ACCÈS
-# ─────────────────────────────────────────────
-
-async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(WINSIGHT_URL, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            login_input = await page.query_selector("input[type='text']")
-            if login_input:
-                await page.fill("input[type='text']", WINSIGHT_USERNAME)
-                await page.fill("input[type='password']", WINSIGHT_PASSWORD)
-                await page.evaluate("""
-                    () => {
-                        const buttons = document.querySelectorAll("button");
-                        for (const btn of buttons) {
-                            if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
-                        }
-                    }
-                """)
-                await asyncio.sleep(3)
-                await page.wait_for_load_state("networkidle", timeout=30000)
-
-            has_access = await page.evaluate(f"""
-                () => {{
-                    const modelName = "{model_name}".toLowerCase();
-                    const discordId = "{discord_id}";
-                    const allElements = document.querySelectorAll("*");
-                    let matchEl = null;
-                    for (const el of allElements) {{
-                        let directText = "";
-                        for (const node of el.childNodes) {{
-                            if (node.nodeType === Node.TEXT_NODE) directText += node.textContent;
-                        }}
-                        if (directText.toLowerCase().includes(modelName)) {{ matchEl = el; break; }}
-                    }}
-                    if (!matchEl) return null;
-                    let parent = matchEl;
-                    for (let i = 0; i < 12; i++) {{
-                        parent = parent.parentElement;
-                        if (!parent) break;
-                        if (parent.textContent.includes(discordId)) return true;
-                        const input = parent.querySelector("input[placeholder*='username'], input[placeholder*='customer']");
-                        if (input) return false;
-                    }}
-                    return null;
-                }}
-            """)
-            await browser.close()
-
-            if has_access is True:
-                return True, f"✅ {discord_id} has access to **{model_name}** on Winsight."
-            elif has_access is False:
-                return False, f"❌ {discord_id} does NOT have access to **{model_name}** on Winsight."
-            else:
-                return False, "⚠️ Could not determine access."
-    except Exception as e:
-        return False, f"Error: {str(e)}"
-
-
-async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(WINSIGHT_URL, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            login_input = await page.query_selector("input[type='text']")
-            if login_input:
-                await page.fill("input[type='text']", WINSIGHT_USERNAME)
-                await page.fill("input[type='password']", WINSIGHT_PASSWORD)
-                await page.evaluate("""
-                    () => {
-                        const buttons = document.querySelectorAll("button");
-                        for (const btn of buttons) {
-                            if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
-                        }
-                    }
-                """)
-                await asyncio.sleep(3)
-                await page.wait_for_load_state("networkidle", timeout=30000)
-
-            try:
-                title_el = page.locator(f"*:has-text('{model_name}')").last
-                model_card = title_el
-                chip_locator = None
-                count = 0
-                for _ in range(8):
-                    chip_locator = model_card.locator(f"[data-testid*='badge-share'][data-testid*='{discord_id}']")
-                    count = await chip_locator.count()
-                    if count > 0:
-                        break
-                    model_card = model_card.locator("xpath=..")
-
-                if count == 0:
-                    await browser.close()
-                    return False, f"⚠️ {discord_id} doesn't appear to have access to **{model_name}**."
-
-                await chip_locator.first.click(timeout=5000)
-                result = "clicked"
-            except Exception as e:
-                result = "click_failed"
-
-            await asyncio.sleep(2)
-            await browser.close()
-
-            if result == "clicked":
-                return True, f"✅ Access revoked for {discord_id} on **{model_name}**."
-            else:
-                return False, "❌ Found chip but couldn't click remove."
-    except Exception as e:
-        return False, f"Error: {str(e)}"
-
-
-async def enginex_check(email: str, model_name: str) -> tuple[bool, str]:
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(ENGINEX_LOGIN_URL, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await page.locator("input[type='email'], input[name='email']").first.fill(ENGINEX_USERNAME)
-            await page.locator("input[type='password']").first.fill(ENGINEX_PASSWORD)
-            await page.evaluate("""
-                () => {
-                    const buttons = document.querySelectorAll("button");
-                    for (const btn of buttons) {
-                        if (btn.textContent.toUpperCase().includes("SIGN IN")) { btn.click(); return true; }
-                    }
-                }
-            """)
-            await asyncio.sleep(3)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await page.goto(ENGINEX_ENTITLEMENTS_URL, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
-
-            has_access = await page.evaluate(f"""
-                () => {{
-                    const emailLower = "{email}".toLowerCase();
-                    const modelName = "{model_name}".toLowerCase();
-                    const rows = document.querySelectorAll("tr, [class*='row']");
-                    for (const row of rows) {{
-                        if (row.textContent.toLowerCase().includes(emailLower)) {{
-                            return row.textContent.toLowerCase().includes(modelName);
-                        }}
-                    }}
-                    return null;
-                }}
-            """)
-            await browser.close()
-
-            if has_access is True:
-                return True, f"✅ {email} has access to **{model_name}** on EngineX."
-            elif has_access is False:
-                return False, f"❌ {email} does NOT have access to **{model_name}** on EngineX."
-            else:
-                return False, f"⚠️ Could not find {email} in entitlements."
-    except Exception as e:
-        return False, f"Error: {str(e)}"
 
 
 # ─────────────────────────────────────────────
@@ -1926,47 +1751,6 @@ def get_platforms_for_group(group_name: str) -> list:
 
 def get_platforms_for_model(model_name: str) -> list:
     return list(load_products().get(model_name, {}).keys())
-
-
-@tree.command(name="sethelios", description="Lier un jeu à un Resource ID Helios")
-@app_commands.describe(
-    name="Nom du jeu/modèle (ex: Valorant, Marvels)",
-    resource_id="UUID de la ressource Helios (ex: 6cabf1d2-8887-4b36-885d-e888b82f7987)",
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def sethelios_cmd(interaction: discord.Interaction, name: str, resource_id: str):
-    helios_res = load_helios_resources()
-    helios_res[name] = resource_id
-    save_helios_resources(helios_res)
-    await interaction.response.send_message(
-        f"✅ Helios: **{name}** → `{resource_id}`", ephemeral=False
-    )
-    await backup_config_to_discord("sethelios")
-
-
-@tree.command(name="removehelios", description="Supprimer un lien jeu → Helios")
-@app_commands.checks.has_permissions(administrator=True)
-async def removehelios_cmd(interaction: discord.Interaction, name: str):
-    helios_res = load_helios_resources()
-    if name not in helios_res:
-        await interaction.response.send_message(f"⚠️ **{name}** not found in Helios resources.", ephemeral=True)
-        return
-    del helios_res[name]
-    save_helios_resources(helios_res)
-    await interaction.response.send_message(f"🚫 Helios: **{name}** removed.", ephemeral=False)
-    await backup_config_to_discord("removehelios")
-
-
-@tree.command(name="helioslist", description="Lister les ressources Helios enregistrées")
-@app_commands.checks.has_permissions(administrator=True)
-async def helioslist_cmd(interaction: discord.Interaction):
-    helios_res = load_helios_resources()
-    if not helios_res:
-        await interaction.response.send_message("Aucune ressource Helios enregistrée.", ephemeral=True)
-        return
-    lines = [f"● **{name}** → `{rid}`" for name, rid in helios_res.items()]
-    embed = discord.Embed(title="🔑 Helios Resources", description="\n".join(lines), color=EMBED_COLOR)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="setpipeline", description="Enregistrer le nom exact d'une pipeline sur Winsight")
@@ -2041,7 +1825,7 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
 @app_commands.describe(
     model="Le jeu à donner (ex: Valorant → grant toutes les versions Valorant)",
     platform="La plateforme",
-    contact="ID Discord (Winsight) ou email (EngineX)",
+    contact="ID Discord du client",
 )
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
@@ -2067,30 +1851,18 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
 
     async def run():
         if platform.value == "helios":
-            # Helios : API call pour chaque resource_id associé au groupe
-            nb_ok, nb_fail, details = await helios_grant_group(contact, group_name)
-        elif platform.value == "enginex":
-            # EngineX : liste fixe depuis products.json (pas de scraping live)
-            all_models = get_models_for_group(group_name)
-            products = load_products()
-            models_on_platform = [m for m in all_models if platform.value in products.get(m, {})]
-            results = []
-            total_ok = 0
-            for m in models_on_platform:
-                ok, msg = await enginex_grant(contact, m)
-                results.append(f"{'✓' if ok else '✗'} {get_display_name(m)}")
-                if ok:
-                    total_ok += 1
-            nb_ok = total_ok
-            nb_fail = len(models_on_platform) - total_ok
-            details = results
+            # Helios : simple API call, un seul resource
+            ok, msg = await helios_grant(contact)
+            nb_ok = 1 if ok else 0
+            nb_fail = 0 if ok else 1
+            details = [f"{'✓' if ok else '✗'} Helios — {msg}"]
         else:
             # Winsight : scraping dynamique
             nb_ok, nb_fail, details = await winsight_grant_all_dynamic(contact, group_name)
 
         all_ok = nb_fail == 0
         color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
-        prefix = "WIN" if platform.value == "winsight" else ("HEL" if platform.value == "helios" else "EX")
+        prefix = "HEL" if platform.value == "helios" else "WIN"
 
         if all_ok:
             title = f"✅ {prefix} Granted — {group_name}"
@@ -2101,10 +1873,7 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
 
         embed = discord.Embed(title=title, color=color)
 
-        if platform.value == "enginex":
-            embed.add_field(name="EngineX Email", value=contact, inline=False)
-        else:
-            embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
+        embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
 
         embed.add_field(
             name="Result",
@@ -2126,126 +1895,17 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run())
 
 
-@tree.command(name="checkaccess", description="Vérifier l'accès — ou lister tous les users Helios d'un modèle")
-@app_commands.describe(
-    model="Le jeu à vérifier",
-    platform="La plateforme",
-    contact="ID Discord (Winsight/Helios) ou email (EngineX) — laisser vide pour lister tous les users Helios",
-)
+@tree.command(name="checkaccess", description="Vérifier si un client a accès à un jeu (toutes versions)")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
-async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str = None):
+async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
     group_name = model
-
-    if platform.value == "helios":
-        helios_res = load_helios_resources()
-        matching = {name: rid for name, rid in helios_res.items() if group_name.lower() in name.lower()}
-        if not matching:
-            await interaction.response.send_message(
-                f"❌ Aucune ressource Helios pour **{group_name}**. Utilise `/sethelios`.", ephemeral=True
-            )
-            return
-
-        if contact:
-            # Check un user spécifique
-            await interaction.response.send_message(
-                f"⏳ Checking Helios access for `{contact}`...", ephemeral=True
-            )
-
-            async def run():
-                lines = []
-                for name, rid in matching.items():
-                    _, msg = await helios_check(contact, rid)
-                    lines.append(f"**{name}**: {msg}")
-                embed = discord.Embed(
-                    title=f"🔍 Helios Check — {group_name}",
-                    description="\n".join(lines),
-                    color=0x5865F2,
-                )
-                await interaction.followup.send(embed=embed, ephemeral=True)
-
-            asyncio.create_task(run())
-        else:
-            # Lister TOUS les users qui ont accès
-            await interaction.response.send_message(
-                f"⏳ Fetching all users with access to **{group_name}** on Helios...", ephemeral=True
-            )
-
-            async def run():
-                for name, rid in matching.items():
-                    url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users&limit=200&offset=0"
-                    headers = {"Authorization": f"Bearer {HELIOS_API_KEY}"}
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                                raw = await resp.text()
-                                print(f"[Helios Check List] {name}: status={resp.status} body={raw[:300]}")
-                                try:
-                                    body = json.loads(raw)
-                                except (json.JSONDecodeError, TypeError):
-                                    await interaction.followup.send(f"❌ Helios returned non-JSON for {name}: `{raw[:200]}`", ephemeral=True)
-                                    continue
-                                if not isinstance(body, dict) or not body.get("success"):
-                                    await interaction.followup.send(f"❌ Helios API error for {name}: {raw[:200]}", ephemeral=True)
-                                    continue
-                                users = body.get("data", [])
-                                # data peut être un dict avec une clé "items" ou "records", ou directement une list
-                                if isinstance(users, dict):
-                                    users = users.get("items", users.get("records", list(users.values())))
-                                if not isinstance(users, list):
-                                    users = []
-                                if not users:
-                                    embed = discord.Embed(
-                                        title=f"👥 {name} — No users",
-                                        description="Aucun utilisateur n'a accès.",
-                                        color=0x2F3136,
-                                    )
-                                else:
-                                    lines = []
-                                    for i, user in enumerate(users, 1):
-                                        if isinstance(user, str):
-                                            lines.append(f"`{i}.` `{user}`")
-                                            continue
-                                        if not isinstance(user, dict):
-                                            lines.append(f"`{i}.` `{user}`")
-                                            continue
-                                        did = user.get("discord_id", "?")
-                                        notes = user.get("notes", "")
-                                        expires = user.get("expires_at", "never")
-                                        line = f"`{i}.` <@{did}> (`{did}`)"
-                                        if notes:
-                                            line += f" — {notes}"
-                                        if expires and expires != "never":
-                                            line += f" ⏰ {expires}"
-                                        lines.append(line)
-                                    # Split en chunks de 4096 chars si nécessaire
-                                    desc = "\n".join(lines)
-                                    if len(desc) > 4000:
-                                        desc = desc[:4000] + f"\n... et {len(users) - len(lines)} de plus"
-                                    embed = discord.Embed(
-                                        title=f"👥 {name} — {len(users)} user(s)",
-                                        description=desc,
-                                        color=0x5865F2,
-                                    )
-                                    embed.set_footer(text=f"Resource: {rid}")
-                                await interaction.followup.send(embed=embed, ephemeral=True)
-                    except Exception as e:
-                        await interaction.followup.send(f"❌ Error fetching {name}: {e}", ephemeral=True)
-
-            asyncio.create_task(run())
-        return
-
-    # Winsight / EngineX — logique existante
     available_platforms = get_platforms_for_group(group_name)
     if platform.value not in available_platforms:
         await interaction.response.send_message(
             f"❌ **{group_name}** not configured on **{platform.name}**.", ephemeral=True
         )
-        return
-
-    if not contact:
-        await interaction.response.send_message("❌ `contact` est requis pour Winsight/EngineX.", ephemeral=True)
         return
 
     all_models = get_models_for_group(group_name)
@@ -2259,10 +1919,7 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
     async def run():
         lines = []
         for m in models_on_platform:
-            if platform.value == "enginex":
-                _, msg = await enginex_check(contact, m)
-            else:
-                _, msg = await winsight_check(contact, m)
+            _, msg = await winsight_check(contact, m)
             lines.append(f"**{get_display_name(m)}**: {msg}")
         embed = discord.Embed(
             title=f"🔍 Access Check — {group_name}",
@@ -2274,51 +1931,43 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run())
 
 
-@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight ou Helios)")
-@app_commands.describe(
-    model="Le jeu à révoquer",
-    platform="La plateforme (Winsight ou Helios)",
-    contact="ID Discord du client",
-)
+@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight uniquement, toutes versions)")
 @app_commands.autocomplete(model=model_autocomplete)
-@app_commands.choices(platform=[
-    app_commands.Choice(name="Winsight", value="winsight"),
-    app_commands.Choice(name="Helios", value="helios"),
-])
 @app_commands.checks.has_permissions(administrator=True)
-async def revoke_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
+async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str):
     group_name = model
+    available_platforms = get_platforms_for_group(group_name)
+    if "winsight" not in available_platforms:
+        await interaction.response.send_message(
+            f"❌ **{group_name}** not on Winsight.", ephemeral=True
+        )
+        return
+
+    all_models = get_models_for_group(group_name)
+    products = load_products()
+    models_on_winsight = [m for m in all_models if "winsight" in products.get(m, {})]
 
     await interaction.response.send_message(
-        f"⏳ Revoking **{group_name}** on **{platform.name}** from `{contact}`...",
-        ephemeral=False,
+        f"⏳ Revoking **{group_name}** ({len(models_on_winsight)} version(s)) for `{contact}`...", ephemeral=True
     )
 
     async def run():
-        if platform.value == "helios":
-            nb_ok, nb_fail, details = await helios_revoke_group(contact, group_name)
-        else:
-            nb_ok, nb_fail, details = await winsight_revoke_all_dynamic(contact, group_name)
-
-        all_ok = nb_fail == 0 and nb_ok > 0
-        color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
-        prefix = "HEL" if platform.value == "helios" else "WIN"
-
-        if all_ok:
-            title = f"✅ {prefix} Revoked — {group_name}"
-        elif nb_ok > 0:
-            title = f"⚠️ {prefix} Partial Revoke — {group_name}"
-        else:
-            title = f"❌ {prefix} Revoke Failed — {group_name}"
-
-        embed = discord.Embed(title=title, color=color)
-        embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
+        lines = []
+        nb_ok = 0
+        for m in models_on_winsight:
+            ok, msg = await winsight_revoke(contact, m)
+            lines.append(f"{'✓' if ok else '✗'} {get_display_name(m)}: {msg}")
+            if ok:
+                nb_ok += 1
+        nb_fail = len(models_on_winsight) - nb_ok
+        all_ok = nb_fail == 0
+        embed = discord.Embed(
+            title=f"{'✅' if all_ok else '⚠️'} Revoke — {group_name}",
+            description="\n".join(lines),
+            color=0x57F287 if all_ok else 0xF1C40F,
+        )
         embed.add_field(name="Result", value=f"{nb_ok} revoked, {nb_fail} failed", inline=False)
-        embed.add_field(name="Details", value="\n".join(details) or "—", inline=False)
-        embed.set_footer(text=f"Revoke • by {interaction.user}")
-
-        await interaction.channel.send(embed=embed)
-        await interaction.followup.send("✅ Result posted above.", ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     asyncio.create_task(run())
 
@@ -2341,12 +1990,12 @@ class VouchModal(discord.ui.Modal, title="Leave a Vouch"):
         self.rating = rating
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not VOUCH_CHANNEL_ID:
-            await interaction.response.send_message("⚠️ Vouch channel not configured.", ephemeral=True)
-            return
-        channel = bot.get_channel(VOUCH_CHANNEL_ID)
+        channel = get_guild_channel(interaction.guild_id, "vouch_channel_id")
         if not channel:
-            await interaction.response.send_message("⚠️ Could not find vouch channel.", ephemeral=True)
+            await interaction.response.send_message(
+                "⚠️ Vouch channel not configured on this server. An admin can set it with `/setup`.",
+                ephemeral=True,
+            )
             return
         stars = "⭐" * self.rating + "☆" * (5 - self.rating)
         embed = discord.Embed(title=stars, description=str(self.text_input.value), color=0xF1C40F)
