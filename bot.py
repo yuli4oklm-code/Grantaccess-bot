@@ -860,8 +860,8 @@ async def weight_autocomplete(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=name, value=wid) for wid, name in matches[:25]]
 
 
-@tree.command(name="weight", description="Poster l'embed d'un weight dans le salon")
-@app_commands.describe(weight_id="Le weight à poster")
+@tree.command(name="weight", description="Post a weight embed in this channel")
+@app_commands.describe(weight_id="The weight to post")
 @app_commands.autocomplete(weight_id=weight_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def weight_cmd(interaction: discord.Interaction, weight_id: str):
@@ -878,8 +878,8 @@ async def weight_cmd(interaction: discord.Interaction, weight_id: str):
     await interaction.response.send_message("✅ Weight posted!", ephemeral=True)
 
 
-@tree.command(name="weightadd", description="Ajouter ou modifier un weight (modal)")
-@app_commands.describe(weight_id="Laisser vide pour créer, ou choisir un weight existant à modifier")
+@tree.command(name="weightadd", description="Add or edit a weight (modal)")
+@app_commands.describe(weight_id="Leave empty to create, or pick an existing weight to edit")
 @app_commands.autocomplete(weight_id=weight_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def weightadd_cmd(interaction: discord.Interaction, weight_id: str = None):
@@ -895,8 +895,8 @@ async def weightadd_cmd(interaction: discord.Interaction, weight_id: str = None)
     await interaction.response.send_modal(modal)
 
 
-@tree.command(name="weightspecs", description="Éditer les specs d'un weight")
-@app_commands.describe(weight_id="Le weight dont tu veux éditer les specs")
+@tree.command(name="weightspecs", description="Edit a weight's specs")
+@app_commands.describe(weight_id="The weight whose specs you want to edit")
 @app_commands.autocomplete(weight_id=weight_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def weightspecs_cmd(interaction: discord.Interaction, weight_id: str):
@@ -909,8 +909,8 @@ async def weightspecs_cmd(interaction: discord.Interaction, weight_id: str):
     await interaction.response.send_modal(modal)
 
 
-@tree.command(name="weightdelete", description="Supprimer un weight")
-@app_commands.describe(weight_id="Le weight à supprimer")
+@tree.command(name="weightdelete", description="Delete a weight")
+@app_commands.describe(weight_id="The weight to delete")
 @app_commands.autocomplete(weight_id=weight_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def weightdelete_cmd(interaction: discord.Interaction, weight_id: str):
@@ -924,7 +924,7 @@ async def weightdelete_cmd(interaction: discord.Interaction, weight_id: str):
     await interaction.response.send_message(f"🗑️ Weight **{name}** deleted.", ephemeral=True)
 
 
-@tree.command(name="weightlist", description="Lister tous les weights enregistrés")
+@tree.command(name="weightlist", description="List all registered weights")
 @app_commands.checks.has_permissions(administrator=True)
 async def weightlist_cmd(interaction: discord.Interaction):
     weights = load_weights()
@@ -1114,8 +1114,8 @@ async def on_ready():
     for weight_id in weights:
         bot.add_view(WeightView(weight_id))
 
-    print(f"✅ Bot connecté en tant que {bot.user} (ID: {bot.user.id})")
-    print(f"📡 Présent sur {len(bot.guilds)} serveur(s) : {', '.join(g.name for g in bot.guilds)}")
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"📡 Connected to {len(bot.guilds)} server(s): {', '.join(g.name for g in bot.guilds)}")
 
     # Panneau de commande : un par serveur qui l'a configuré
     for guild in bot.guilds:
@@ -1134,12 +1134,12 @@ async def on_ready():
 #  COMMANDES ADMIN EXISTANTES
 # ─────────────────────────────────────────────
 
-@tree.command(name="setup", description="Configurer les salons du bot pour CE serveur")
+@tree.command(name="setup", description="Configure the bot's channels for THIS server")
 @app_commands.describe(
-    staff_channel="Salon où le bot poste les rapports de livraison et les tickets",
-    order_panel_channel="Salon où poster le panneau de commande au démarrage",
-    vouch_channel="Salon où poster les avis clients",
-    ticket_category="Catégorie dans laquelle créer les salons de ticket",
+    staff_channel="Channel where the bot posts delivery reports and ticket alerts",
+    order_panel_channel="Channel where the order panel is posted on startup",
+    vouch_channel="Channel where customer reviews are posted",
+    ticket_category="Category in which ticket channels are created",
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_cmd(
@@ -1150,7 +1150,7 @@ async def setup_cmd(
     ticket_category: discord.CategoryChannel = None,
 ):
     if not interaction.guild:
-        await interaction.response.send_message("❌ Cette commande doit être utilisée dans un serveur.", ephemeral=True)
+        await interaction.response.send_message("❌ This command must be used inside a server.", ephemeral=True)
         return
 
     updates = {}
@@ -1171,28 +1171,28 @@ async def setup_cmd(
     def show(key, is_category=False):
         value = config.get(key)
         if not value:
-            return "*non configuré*"
+            return "*not configured*"
         channel = interaction.guild.get_channel(int(value))
         if channel:
             return channel.mention if not is_category else f"**{channel.name}**"
-        return f"`{value}` *(introuvable sur ce serveur)*"
+        return f"`{value}` *(not found on this server)*"
 
     embed = discord.Embed(
         title=f"⚙️ Configuration — {interaction.guild.name}",
-        description="Relance `/setup` avec les options que tu veux changer." if updates
-        else "Aucune modification. Passe des salons en options pour les définir.",
+        description="Run `/setup` again with the options you want to change." if updates
+        else "Nothing changed. Pass channels as options to set them.",
         color=EMBED_COLOR,
     )
     embed.add_field(name="Staff", value=show("staff_channel_id"), inline=False)
-    embed.add_field(name="Panneau de commande", value=show("order_panel_channel_id"), inline=False)
-    embed.add_field(name="Avis (vouch)", value=show("vouch_channel_id"), inline=False)
-    embed.add_field(name="Catégorie tickets", value=show("ticket_category_id", True), inline=False)
-    embed.set_footer(text="Les weights, produits et pipelines sont partagés entre tous les serveurs.")
+    embed.add_field(name="Order panel", value=show("order_panel_channel_id"), inline=False)
+    embed.add_field(name="Reviews (vouch)", value=show("vouch_channel_id"), inline=False)
+    embed.add_field(name="Ticket category", value=show("ticket_category_id", True), inline=False)
+    embed.set_footer(text="Weights, products and pipelines are shared across all servers.")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="order", description="Poster le panneau de commande Stripe")
+@tree.command(name="order", description="Post the Stripe order panel")
 @app_commands.checks.has_permissions(administrator=True)
 async def order_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title=ORDER_EMBED_TITLE, description=ORDER_EMBED_DESCRIPTION, color=EMBED_COLOR)
@@ -1206,7 +1206,7 @@ platform_choices = [
 ]
 
 
-@tree.command(name="addproduct", description="Ajouter ou mettre à jour un modèle/plateforme en vente")
+@tree.command(name="addproduct", description="Add or update a model/platform for sale")
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def addproduct_cmd(interaction: discord.Interaction, model: str, price_eur: float, platform: app_commands.Choice[str]):
@@ -1222,8 +1222,8 @@ async def addproduct_cmd(interaction: discord.Interaction, model: str, price_eur
     await backup_config_to_discord("addproduct")
 
 
-@tree.command(name="removeproduct", description="Retirer un modèle (ou une plateforme précise) de la vente")
-@app_commands.describe(platform="Laisse vide pour retirer le modèle de TOUTES les plateformes")
+@tree.command(name="removeproduct", description="Remove a model (or one specific platform) from sale")
+@app_commands.describe(platform="Leave empty to remove the model from ALL platforms")
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def removeproduct_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str] = None):
@@ -1275,8 +1275,8 @@ def build_product_list_embed() -> discord.Embed:
     return embed
 
 
-@tree.command(name="productlist", description="Afficher la liste des modèles disponibles")
-@app_commands.describe(public="Poster publiquement dans le salon (par défaut: visible que pour toi)")
+@tree.command(name="productlist", description="Show the list of available models")
+@app_commands.describe(public="Post publicly in the channel (default: only visible to you)")
 async def productlist_cmd(interaction: discord.Interaction, public: bool = False):
     embed = build_product_list_embed()
     await interaction.response.send_message(embed=embed, ephemeral=not public)
@@ -1346,7 +1346,7 @@ class WinsightClient:
 
     async def _login(self):
         if not WINSIGHT_USERNAME or not WINSIGHT_PASSWORD:
-            raise WinsightError("WINSIGHT_USERNAME / WINSIGHT_PASSWORD ne sont pas configurés.")
+            raise WinsightError("WINSIGHT_USERNAME / WINSIGHT_PASSWORD are not configured.")
         session = await self._get_session()
         async with session.post(
             self._url("/login"),
@@ -1360,7 +1360,7 @@ class WinsightClient:
             message = ""
             if isinstance(body, dict):
                 message = body.get("message") or body.get("error") or ""
-            raise WinsightError(message or f"Login refusé (HTTP {resp.status}).")
+            raise WinsightError(message or f"Login rejected (HTTP {resp.status}).")
 
     async def _ensure_auth(self):
         if self._authenticated:
@@ -1421,7 +1421,7 @@ class WinsightClient:
         if len(exact) == 1:
             return exact[0]
         if len(exact) > 1:
-            raise WinsightError(f"« {model_name} » correspond à {len(exact)} weights portant le même nom.")
+            raise WinsightError(f"'{model_name}' matches {len(exact)} weights with the same name.")
 
         partial = [
             w for w in weights
@@ -1430,9 +1430,9 @@ class WinsightClient:
         if len(partial) == 1:
             return partial[0]
         if not partial:
-            raise WinsightError(f"« {model_name} » introuvable sur Winsight.")
+            raise WinsightError(f"'{model_name}' not found on Winsight.")
         names = ", ".join(w.get("fileName", "?") for w in partial[:5])
-        raise WinsightError(f"« {model_name} » est ambigu ({len(partial)} correspondances : {names}).")
+        raise WinsightError(f"'{model_name}' is ambiguous ({len(partial)} matches: {names}).")
 
     # ── partages ─────────────────────────────
 
@@ -1477,7 +1477,7 @@ async def _winsight_share_one(weight: dict, username: str) -> tuple[bool, str]:
     name = weight.get("fileName", f"#{weight.get('id')}")
     try:
         if await winsight.has_share(weight["id"], username):
-            return True, f"✓ {name} (déjà partagé)"
+            return True, f"✓ {name} (already shared)"
         await winsight.share(weight["id"], username)
         return True, f"✓ {name}"
     except Exception as e:
@@ -1507,10 +1507,10 @@ async def winsight_grant_all_dynamic(discord_id: str, keyword: str) -> tuple[int
     try:
         matches = await winsight.find_weights(keyword)
     except Exception as e:
-        return 0, 1, [f"✗ Erreur API Winsight : {e}"]
+        return 0, 1, [f"✗ Winsight API error: {e}"]
 
     if not matches:
-        return 0, 0, [f"⚠️ Aucune weight contenant « {keyword} » trouvée sur Winsight."]
+        return 0, 0, [f"⚠️ No weight matching '{keyword}' found on Winsight."]
 
     successes = 0
     failures = 0
@@ -1556,8 +1556,8 @@ async def winsight_check(discord_id: str, model_name: str) -> tuple[bool, str]:
         weight = await winsight.find_weight(model_name)
         name = weight.get("fileName", model_name)
         if await winsight.has_share(weight["id"], discord_id):
-            return True, f"✅ {discord_id} a accès à **{name}**."
-        return False, f"❌ {discord_id} n'a PAS accès à **{name}**."
+            return True, f"✅ {discord_id} has access to **{name}**."
+        return False, f"❌ {discord_id} does NOT have access to **{name}**."
     except Exception as e:
         return False, f"⚠️ {e}"
 
@@ -1573,12 +1573,12 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
     name = weight.get("fileName", model_name)
     try:
         if not await winsight.has_share(weight["id"], discord_id):
-            return False, f"⚠️ {discord_id} n'a pas accès à **{name}**."
+            return False, f"⚠️ {discord_id} does not have access to **{name}**."
         await winsight.unshare(weight["id"], discord_id)
         # On relit la liste : c'est la seule preuve que le retrait a bien eu lieu.
         if await winsight.has_share(weight["id"], discord_id):
-            return False, f"✗ {name} (le partage est toujours actif après suppression)"
-        return True, f"✓ {name} — accès retiré à {discord_id}"
+            return False, f"✗ {name} (share still active after removal)"
+        return True, f"✓ {name} — access revoked for {discord_id}"
     except Exception as e:
         return False, f"✗ {name} — {e}"
 
@@ -1753,7 +1753,7 @@ def get_platforms_for_model(model_name: str) -> list:
     return list(load_products().get(model_name, {}).keys())
 
 
-@tree.command(name="setpipeline", description="Enregistrer le nom exact d'une pipeline sur Winsight")
+@tree.command(name="setpipeline", description="Register a pipeline's exact name on Winsight")
 @app_commands.checks.has_permissions(administrator=True)
 async def setpipeline_cmd(interaction: discord.Interaction, pipeline: str, site_name: str):
     pipelines = load_pipelines()
@@ -1765,40 +1765,40 @@ async def setpipeline_cmd(interaction: discord.Interaction, pipeline: str, site_
     await backup_config_to_discord("setpipeline")
 
 
-@tree.command(name="removepipeline", description="Supprimer une pipeline enregistrée")
+@tree.command(name="removepipeline", description="Delete a registered pipeline")
 @app_commands.autocomplete(pipeline=pipeline_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def removepipeline_cmd(interaction: discord.Interaction, pipeline: str):
     pipelines = load_pipelines()
     if pipeline not in pipelines:
-        await interaction.response.send_message(f"⚠️ Pipeline **{pipeline}** introuvable.", ephemeral=False)
+        await interaction.response.send_message(f"⚠️ Pipeline **{pipeline}** not found.", ephemeral=False)
         return
     del pipelines[pipeline]
     save_pipelines(pipelines)
-    await interaction.response.send_message(f"🚫 Pipeline **{pipeline}** supprimée.", ephemeral=False)
+    await interaction.response.send_message(f"🚫 Pipeline **{pipeline}** deleted.", ephemeral=False)
     await backup_config_to_discord("removepipeline")
 
 
-@tree.command(name="pipelinelist", description="Afficher les pipelines enregistrées")
+@tree.command(name="pipelinelist", description="Show registered pipelines")
 @app_commands.checks.has_permissions(administrator=True)
 async def pipelinelist_cmd(interaction: discord.Interaction):
     pipelines = load_pipelines()
     if not pipelines:
-        await interaction.response.send_message("Aucune pipeline enregistrée.", ephemeral=False)
+        await interaction.response.send_message("No pipelines registered.", ephemeral=False)
         return
     lines = [f"● **{name}** → `{site_name}`" for name, site_name in pipelines.items()]
-    embed = discord.Embed(title="Pipelines Winsight", description="\n".join(lines), color=EMBED_COLOR)
+    embed = discord.Embed(title="Winsight Pipelines", description="\n".join(lines), color=EMBED_COLOR)
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
-@tree.command(name="pipelineadd", description="Ajouter une pipeline Winsight à un utilisateur")
+@tree.command(name="pipelineadd", description="Give a Winsight pipeline to a user")
 @app_commands.autocomplete(pipeline=pipeline_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, discord_id: str):
     pipelines = load_pipelines()
     if pipeline not in pipelines:
         await interaction.response.send_message(
-            f"❌ Pipeline **{pipeline}** introuvable.", ephemeral=False
+            f"❌ Pipeline **{pipeline}** not found.", ephemeral=False
         )
         return
     site_name = pipelines[pipeline]
@@ -1821,11 +1821,11 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
     asyncio.create_task(run())
 
 
-@tree.command(name="grantaccess", description="Donner manuellement l'accès à un jeu (toutes versions d'un coup)")
+@tree.command(name="grantaccess", description="Manually grant access to a game (all versions at once)")
 @app_commands.describe(
-    model="Le jeu à donner (ex: Valorant → grant toutes les versions Valorant)",
-    platform="La plateforme",
-    contact="ID Discord du client",
+    model="The game to grant (e.g. Valorant → grants every Valorant version)",
+    platform="The platform",
+    contact="Customer's Discord ID",
 )
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
@@ -1895,7 +1895,7 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run())
 
 
-@tree.command(name="checkaccess", description="Vérifier si un client a accès à un jeu (toutes versions)")
+@tree.command(name="checkaccess", description="Check whether a customer has access to a game (all versions)")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
@@ -1931,7 +1931,7 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
     asyncio.create_task(run())
 
 
-@tree.command(name="revoke", description="Retirer l'accès d'un client (Winsight uniquement, toutes versions)")
+@tree.command(name="revoke", description="Revoke a customer's access (Winsight only, all versions)")
 @app_commands.autocomplete(model=model_autocomplete)
 @app_commands.checks.has_permissions(administrator=True)
 async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str):
@@ -2017,7 +2017,7 @@ class RatingSelect(discord.ui.Select):
         await interaction.response.send_modal(VouchModal(int(self.values[0])))
 
 
-@tree.command(name="vouch", description="Laisser un témoignage")
+@tree.command(name="vouch", description="Leave a review")
 async def vouch_cmd(interaction: discord.Interaction):
     view = discord.ui.View(timeout=120)
     view.add_item(RatingSelect())
