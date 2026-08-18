@@ -54,6 +54,7 @@ PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
 WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
 GUILDS_FILE = os.path.join(DATA_DIR, "guilds.json")
 HELIOS_RESOURCES_FILE = os.path.join(DATA_DIR, "helios_resources.json")
+CATEGORIES_FILE = os.path.join(DATA_DIR, "categories.json")
 
 EMBED_COLOR = 0x2F3136
 CONFIG_BACKUP_MARKER = "WINSIGHT_BOT_CONFIG_BACKUP_V1"
@@ -103,46 +104,108 @@ def get_display_name(model_name: str) -> str:
     return name.strip()
 
 
-def get_game_group(model_name: str) -> str:
-    """
-    Retourne le nom du 'jeu' sans numéro de version.
-    XyCubValorantV2 → "Valorant"
-    XyCubValorantV3 → "Valorant"
-    XyCubCODV1     → "COD"
-    Permet de regrouper toutes les versions d'un même jeu.
-    """
-    name = strip_prefix(model_name)
-    # CamelCase → mots
-    name = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
-    # Retirer le suffixe Vx (version)
-    name = re.sub(r'\s*V\d+\s*$', '', name).strip()
-    return name
+# ─────────────────────────────────────────────
+#  CATÉGORIES
+# ─────────────────────────────────────────────
+#
+#  Une catégorie regroupe explicitement plusieurs accès sous un seul nom.
+#  Rien n'est déduit du nom des modèles : tu déclares, le bot obéit.
+#
+#  categories.json :
+#  {
+#    "Valorant": {
+#      "winsight": [{"id": "XyCubValorantV1", "label": "Valorant V1"}, ...],
+#      "helios":   [{"id": "6cabf1d2-...",    "label": "Valorant V1"}, ...]
+#    }
+#  }
+#
+#  Sur Winsight l'`id` est le nom du weight ; sur Helios c'est l'UUID de l'item.
 
 
-def get_models_for_group(group_name: str) -> list[str]:
-    """
-    Retourne tous les model_names dont le game_group correspond à group_name (insensible à la casse).
-    Ex: "Valorant" → ["XyCubValorantV2", "XyCubValorantV3"]
-    """
-    products = load_products()
-    return [
-        name for name in products.keys()
-        if get_game_group(name).lower() == group_name.lower()
-    ]
+def load_categories():
+    return load_json(CATEGORIES_FILE, {})
 
 
-def get_grouped_products() -> dict[str, list[str]]:
-    """
-    Retourne un dict {group_name: [model1, model2, ...]} groupé par jeu.
-    Ex: {"Valorant": ["XyCubValorantV2", "XyCubValorantV3"], "COD": [...]}
-    """
-    products = load_products()
-    groups: dict[str, list[str]] = {}
-    for name in products.keys():
-        group = get_game_group(name)
-        groups.setdefault(group, []).append(name)
-    return groups
+def save_categories(data):
+    save_json(CATEGORIES_FILE, data)
 
+
+def find_category(name: str):
+    """Recherche insensible à la casse. Retourne (nom_canonique, data) ou (None, None)."""
+    if not name:
+        return None, None
+    categories = load_categories()
+    if name in categories:
+        return name, categories[name]
+    target = name.strip().lower()
+    for key, data in categories.items():
+        if key.strip().lower() == target:
+            return key, data
+    return None, None
+
+
+def get_category_members(name: str, platform: str) -> list[dict]:
+    """Membres d'une catégorie sur une plateforme donnée."""
+    _, data = find_category(name)
+    if not data:
+        return []
+    members = data.get(platform) or []
+    return [m for m in members if isinstance(m, dict) and m.get("id")]
+
+
+def get_category_platforms(name: str) -> list[str]:
+    """Plateformes où la catégorie a au moins un membre."""
+    return [p for p in PLATFORMS if get_category_members(name, p)]
+
+
+def member_label(member: dict, platform: str) -> str:
+    """Libellé affichable d'un membre."""
+    label = (member.get("label") or "").strip()
+    if label:
+        return label
+    mid = str(member.get("id", "?"))
+    if platform == "winsight":
+        return get_display_name(mid)
+    return mid[:8] + "…" if len(mid) > 12 else mid
+
+
+def add_category_member(category: str, platform: str, value: str, label: str = None) -> tuple[bool, str]:
+    """Ajoute un membre. Retourne (créé_ou_maj, message)."""
+    categories = load_categories()
+    canonical, _ = find_category(category)
+    key = canonical or category.strip()
+    entry = categories.setdefault(key, {})
+    members = entry.setdefault(platform, [])
+
+    value = value.strip()
+    for m in members:
+        if str(m.get("id", "")).strip().lower() == value.lower():
+            if label:
+                m["label"] = label.strip()
+                save_categories(categories)
+                return True, "label updated"
+            return False, "already in this category"
+
+    members.append({"id": value, "label": (label or "").strip() or None})
+    save_categories(categories)
+    return True, "added"
+
+
+def remove_category_member(category: str, platform: str, value: str) -> bool:
+    categories = load_categories()
+    canonical, _ = find_category(category)
+    if not canonical:
+        return False
+    members = categories.get(canonical, {}).get(platform) or []
+    target = value.strip().lower()
+    kept = [m for m in members if str(m.get("id", "")).strip().lower() != target]
+    if len(kept) == len(members):
+        return False
+    categories[canonical][platform] = kept
+    if not any(categories[canonical].get(p) for p in PLATFORMS):
+        del categories[canonical]
+    save_categories(categories)
+    return True
 
 # ─────────────────────────────────────────────
 #  STOCKAGE
@@ -214,11 +277,6 @@ def get_helios_resource(model_name: str):
             return rid
     return HELIOS_RESOURCE_ID or None
 
-
-def get_models_on_platform(group_name: str, platform: str) -> list[str]:
-    """Modèles d'un groupe (ex: « Valorant ») disponibles sur une plateforme."""
-    products = load_products()
-    return [m for m in get_models_for_group(group_name) if platform in products.get(m, {})]
 
 def load_weights():
     return load_json(WEIGHTS_FILE, {})
@@ -422,6 +480,8 @@ async def restore_config_from_discord():
         save_pipelines(payload["pipelines"])
     if "helios_resources" in payload:
         save_helios_resources(payload["helios_resources"])
+    if "categories" in payload:
+        save_categories(payload["categories"])
     print("[Config Backup] Restored products/pipelines from Discord backup.")
     return True
 
@@ -438,6 +498,7 @@ async def backup_config_to_discord(reason="manual update"):
         "products": load_products(),
         "pipelines": load_pipelines(),
         "helios_resources": load_helios_resources(),
+        "categories": load_categories(),
     }
     content = f"{CONFIG_BACKUP_MARKER}\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
     if len(content) > 2000:
@@ -1790,37 +1851,10 @@ async def process_paid_order(order_id: str):
 #  COMMANDES MANUELLES
 # ─────────────────────────────────────────────
 
-async def model_autocomplete(interaction: discord.Interaction, current: str):
-    """
-    Autocomplete groupé par jeu : affiche "Valorant" (pas "Valorant V2" / "Valorant V3" séparément).
-    La value est le nom du groupe (ex: "Valorant").
-    """
-    groups = get_grouped_products()
-    matches = [
-        group for group in groups.keys()
-        if current.lower() in group.lower()
-    ]
-    return [app_commands.Choice(name=group, value=group) for group in matches[:25]]
-
-
 async def pipeline_autocomplete(interaction: discord.Interaction, current: str):
     pipelines = load_pipelines()
     matches = [name for name in pipelines.keys() if current.lower() in name.lower()]
     return [app_commands.Choice(name=name, value=name) for name in matches[:25]]
-
-
-def get_platforms_for_group(group_name: str) -> list:
-    """Retourne toutes les plateformes disponibles pour un groupe (union de toutes les versions)."""
-    products = load_products()
-    models = get_models_for_group(group_name)
-    platforms = set()
-    for model in models:
-        platforms.update(products.get(model, {}).keys())
-    return list(platforms)
-
-
-def get_platforms_for_model(model_name: str) -> list:
-    return list(load_products().get(model_name, {}).keys())
 
 
 @tree.command(name="setpipeline", description="Register a pipeline's exact name on Winsight")
@@ -1891,160 +1925,267 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
     asyncio.create_task(run())
 
 
-@tree.command(name="grantaccess", description="Manually grant access to a game (all versions at once)")
+# ─────────────────────────────────────────────
+#  COMMANDES CATÉGORIES (admin)
+# ─────────────────────────────────────────────
+
+async def category_autocomplete(interaction: discord.Interaction, current: str):
+    matches = [c for c in load_categories().keys() if current.lower() in c.lower()]
+    return [app_commands.Choice(name=c, value=c) for c in matches[:25]]
+
+
+async def category_member_autocomplete(interaction: discord.Interaction, current: str):
+    """Membres de la catégorie/plateforme déjà choisies dans la commande en cours."""
+    category = getattr(interaction.namespace, "category", None)
+    platform = getattr(interaction.namespace, "platform", None)
+    if not category or not platform:
+        return []
+    key = platform if isinstance(platform, str) else getattr(platform, "value", None)
+    if not key:
+        return []
+    out = []
+    for m in get_category_members(category, key):
+        mid = str(m.get("id"))
+        label = f"{member_label(m, key)} ({mid[:20]})"
+        if current.lower() in label.lower() or current.lower() in mid.lower():
+            out.append(app_commands.Choice(name=label[:100], value=mid))
+    return out[:25]
+
+
+@tree.command(name="categoryadd", description="Add an access to a category (creates it if new)")
 @app_commands.describe(
-    model="The game to grant (e.g. Valorant → grants every Valorant version)",
-    platform="The platform",
-    contact="Customer's Discord ID",
+    category="Category name, e.g. Valorant",
+    platform="Which platform this access lives on",
+    value="Winsight: the weight name — Aim Engine / Cubism: the item UUID",
+    label="Optional display name, e.g. Valorant V1",
 )
-@app_commands.autocomplete(model=model_autocomplete)
+@app_commands.autocomplete(category=category_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
-async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
-    group_name = model
+async def categoryadd_cmd(interaction: discord.Interaction, category: str,
+                          platform: app_commands.Choice[str], value: str, label: str = None):
+    changed, note = add_category_member(category, platform.value, value, label)
+    canonical, _ = find_category(category)
+    icon = "✅" if changed else "⚠️"
+    await interaction.response.send_message(
+        f"{icon} **{canonical}** / {platform.name} → `{value.strip()}` ({note}).",
+        ephemeral=True,
+    )
+    if changed:
+        await backup_config_to_discord("categoryadd")
 
-    available_platforms = get_platforms_for_group(group_name)
-    if platform.value not in available_platforms:
+
+@tree.command(name="categoryremove", description="Remove one access from a category")
+@app_commands.describe(
+    category="Category to edit",
+    platform="Platform the access is on",
+    value="The weight name or item UUID to remove",
+)
+@app_commands.autocomplete(category=category_autocomplete, value=category_member_autocomplete)
+@app_commands.choices(platform=platform_choices)
+@app_commands.checks.has_permissions(administrator=True)
+async def categoryremove_cmd(interaction: discord.Interaction, category: str,
+                             platform: app_commands.Choice[str], value: str):
+    if remove_category_member(category, platform.value, value):
         await interaction.response.send_message(
-            f"❌ **{group_name}** not configured on **{platform.name}**. "
-            f"Available: {', '.join(platform_label(p) for p in available_platforms) or 'none'}",
+            f"🚫 Removed `{value}` from **{category}** / {platform.name}.", ephemeral=True
+        )
+        await backup_config_to_discord("categoryremove")
+    else:
+        await interaction.response.send_message(
+            f"⚠️ `{value}` isn't in **{category}** / {platform.name}.", ephemeral=True
+        )
+
+
+@tree.command(name="categorydelete", description="Delete a whole category")
+@app_commands.autocomplete(category=category_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def categorydelete_cmd(interaction: discord.Interaction, category: str):
+    categories = load_categories()
+    canonical, _ = find_category(category)
+    if not canonical:
+        await interaction.response.send_message(f"⚠️ Category **{category}** not found.", ephemeral=True)
+        return
+    del categories[canonical]
+    save_categories(categories)
+    await interaction.response.send_message(f"🗑️ Category **{canonical}** deleted.", ephemeral=True)
+    await backup_config_to_discord("categorydelete")
+
+
+@tree.command(name="categories", description="List categories and what they contain")
+@app_commands.describe(category="Leave empty to list them all")
+@app_commands.autocomplete(category=category_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def categories_cmd(interaction: discord.Interaction, category: str = None):
+    all_categories = load_categories()
+    if not all_categories:
+        await interaction.response.send_message(
+            "No categories yet. Create one with `/categoryadd`.", ephemeral=True
+        )
+        return
+
+    if category:
+        canonical, data = find_category(category)
+        if not canonical:
+            await interaction.response.send_message(f"⚠️ Category **{category}** not found.", ephemeral=True)
+            return
+        embed = discord.Embed(title=f"📂 {canonical}", color=EMBED_COLOR)
+        for key, cfg in PLATFORMS.items():
+            members = get_category_members(canonical, key)
+            value = "\n".join(
+                f"● **{member_label(m, key)}** — `{m['id']}`" for m in members
+            ) or "*none*"
+            embed.add_field(name=f"{cfg['emoji']} {cfg['label']}", value=value, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    embed = discord.Embed(title="📂 Categories", color=EMBED_COLOR)
+    for name in all_categories:
+        counts = " • ".join(
+            f"{PLATFORMS[p]['emoji']} {len(get_category_members(name, p))}"
+            for p in PLATFORMS
+        )
+        embed.add_field(name=name, value=counts, inline=False)
+    embed.set_footer(text="Use /categories <name> to see the details.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ─────────────────────────────────────────────
+#  GRANT / CHECK / REVOKE (par catégorie)
+# ─────────────────────────────────────────────
+
+async def apply_member(action: str, platform: str, contact: str, member: dict) -> tuple[bool, str]:
+    """
+    Applique grant/check/revoke à un membre de catégorie.
+
+    Sur Helios on passe l'UUID en `resource_id` (il court-circuite le mapping
+    par nom) et le libellé en `model_name`, uniquement pour l'affichage.
+    """
+    mid = str(member["id"])
+    label = member_label(member, platform)
+
+    if platform == "helios":
+        if action == "grant":
+            return await helios_grant(contact, label, resource_id=mid)
+        if action == "check":
+            return await helios_check(contact, label, resource_id=mid)
+        return await helios_revoke(contact, label, resource_id=mid)
+
+    if action == "grant":
+        return await winsight_grant(contact, mid)
+    if action == "check":
+        return await winsight_check(contact, mid)
+    return await winsight_revoke(contact, mid)
+
+
+def category_jobs(category: str, platforms: list[str]) -> list[tuple[str, dict]]:
+    """Liste (plateforme, membre) pour toutes les plateformes visées."""
+    return [
+        (key, member)
+        for key in platforms
+        for member in get_category_members(category, key)
+    ]
+
+
+async def run_category_action(interaction: discord.Interaction, action: str, category: str,
+                              contact: str, platforms: list[str], titles: dict):
+    """Exécute une action sur toute une catégorie et poste le rapport."""
+    jobs = category_jobs(category, platforms)
+    scope = platform_label(platforms[0]) if len(platforms) == 1 else "all platforms"
+
+    if not jobs:
+        await interaction.response.send_message(
+            f"❌ **{category}** has nothing configured on {scope}. "
+            f"Add entries with `/categoryadd`.",
             ephemeral=True,
         )
         return
 
     await interaction.response.send_message(
-        f"⏳ Granting **{group_name}** on **{platform.name}** to `{contact}`...",
-        ephemeral=False,
-    )
-
-    async def run():
-        if platform.value == "helios":
-            # Helios : un item par modèle, résolu via helios_resources.json
-            models = get_models_on_platform(group_name, "helios")
-            details = []
-            nb_ok = 0
-            for m in models:
-                ok, msg = await helios_grant(contact, m)
-                details.append(f"{'✓' if ok else '✗'} {get_display_name(m)} — {msg}")
-                if ok:
-                    nb_ok += 1
-            nb_fail = len(models) - nb_ok
-        else:
-            # Winsight : scraping dynamique
-            nb_ok, nb_fail, details = await winsight_grant_all_dynamic(contact, group_name)
-
-        all_ok = nb_fail == 0
-        color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
-        prefix = platform_label(platform.value)
-
-        if all_ok:
-            title = f"✅ {prefix} Granted — {group_name}"
-        elif nb_ok > 0:
-            title = f"⚠️ {prefix} Partial Grant — {group_name}"
-        else:
-            title = f"❌ {prefix} Grant Failed — {group_name}"
-
-        embed = discord.Embed(title=title, color=color)
-
-        embed.add_field(name="User", value=f"<@{contact}> ({contact})", inline=False)
-
-        embed.add_field(
-            name="Result",
-            value=f"{nb_ok} granted, {nb_fail} failed",
-            inline=False,
-        )
-        embed.add_field(
-            name="Details",
-            value="\n".join(details) or "—",
-            inline=False,
-        )
-        embed.set_footer(text=f"Manual Grant • by {interaction.user}")
-
-        # Poster publiquement dans le salon où la commande a été faite
-        await interaction.channel.send(embed=embed)
-        # Confirmer à l'auteur que c'est envoyé (ephemeral, juste pour lui)
-        await interaction.followup.send("✅ Result posted above.", ephemeral=True)
-
-    asyncio.create_task(run())
-
-
-@tree.command(name="checkaccess", description="Check whether a customer has access to a game (all versions)")
-@app_commands.autocomplete(model=model_autocomplete)
-@app_commands.choices(platform=platform_choices)
-@app_commands.checks.has_permissions(administrator=True)
-async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
-    group_name = model
-    available_platforms = get_platforms_for_group(group_name)
-    if platform.value not in available_platforms:
-        await interaction.response.send_message(
-            f"❌ **{group_name}** not configured on **{platform.name}**.", ephemeral=True
-        )
-        return
-
-    models_on_platform = get_models_on_platform(group_name, platform.value)
-
-    await interaction.response.send_message(
-        f"⏳ Checking **{group_name}** ({len(models_on_platform)} version(s)) for `{contact}`...", ephemeral=True
-    )
-
-    async def run():
-        lines = []
-        for m in models_on_platform:
-            if platform.value == "helios":
-                _, msg = await helios_check(contact, m)
-            else:
-                _, msg = await winsight_check(contact, m)
-            lines.append(f"**{get_display_name(m)}**: {msg}")
-        embed = discord.Embed(
-            title=f"🔍 Access Check — {group_name}",
-            description="\n".join(lines) or "No models found.",
-            color=0x5865F2,
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    asyncio.create_task(run())
-
-
-@tree.command(name="revoke", description="Revoke a customer's access (Winsight only, all versions)")
-@app_commands.autocomplete(model=model_autocomplete)
-@app_commands.checks.has_permissions(administrator=True)
-async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str):
-    group_name = model
-    available_platforms = get_platforms_for_group(group_name)
-    if "winsight" not in available_platforms:
-        await interaction.response.send_message(
-            f"❌ **{group_name}** not on Winsight.", ephemeral=True
-        )
-        return
-
-    all_models = get_models_for_group(group_name)
-    products = load_products()
-    models_on_winsight = [m for m in all_models if "winsight" in products.get(m, {})]
-
-    await interaction.response.send_message(
-        f"⏳ Revoking **{group_name}** ({len(models_on_winsight)} version(s)) for `{contact}`...", ephemeral=True
+        f"⏳ {titles['progress']} **{category}** on {scope} ({len(jobs)} item(s)) for `{contact}`...",
+        ephemeral=True,
     )
 
     async def run():
         lines = []
         nb_ok = 0
-        for m in models_on_winsight:
-            ok, msg = await winsight_revoke(contact, m)
-            lines.append(f"{'✓' if ok else '✗'} {get_display_name(m)}: {msg}")
+        for key, member in jobs:
+            ok, msg = await apply_member(action, key, contact, member)
+            mark = "✓" if ok else "✗"
+            lines.append(f"{mark} `{platform_label(key)}` **{member_label(member, key)}** — {msg}")
             if ok:
                 nb_ok += 1
-        nb_fail = len(models_on_winsight) - nb_ok
+
+        nb_fail = len(jobs) - nb_ok
         all_ok = nb_fail == 0
         embed = discord.Embed(
-            title=f"{'✅' if all_ok else '⚠️'} Revoke — {group_name}",
-            description="\n".join(lines),
-            color=0x57F287 if all_ok else 0xF1C40F,
+            title=f"{'✅' if all_ok else ('⚠️' if nb_ok else '❌')} {titles['done']} — {category}",
+            description="\n".join(lines)[:4000],
+            color=0x57F287 if all_ok else (0xF1C40F if nb_ok else 0xED4245),
         )
-        embed.add_field(name="Result", value=f"{nb_ok} revoked, {nb_fail} failed", inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        embed.add_field(name="Result", value=f"{nb_ok} {titles['unit']}, {nb_fail} failed", inline=False)
+        embed.set_footer(text=f"{titles['done']} • by {interaction.user}")
+
+        if titles.get("public"):
+            await interaction.channel.send(embed=embed)
+            await interaction.followup.send("✅ Result posted above.", ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
     asyncio.create_task(run())
 
+
+@tree.command(name="grantaccess", description="Grant a whole category to a customer")
+@app_commands.describe(
+    category="The category to grant (every access inside it)",
+    platform="Leave empty to grant on ALL platforms",
+    contact="Customer's Discord ID",
+)
+@app_commands.autocomplete(category=category_autocomplete)
+@app_commands.choices(platform=platform_choices)
+@app_commands.checks.has_permissions(administrator=True)
+async def grantaccess_cmd(interaction: discord.Interaction, category: str, contact: str,
+                          platform: app_commands.Choice[str] = None):
+    platforms = [platform.value] if platform else list(PLATFORMS.keys())
+    await run_category_action(
+        interaction, "grant", category, contact, platforms,
+        {"progress": "Granting", "done": "Grant", "unit": "granted", "public": True},
+    )
+
+
+@tree.command(name="checkaccess", description="Check a customer's access to a whole category")
+@app_commands.describe(
+    category="The category to check",
+    platform="Leave empty to check ALL platforms",
+    contact="Customer's Discord ID",
+)
+@app_commands.autocomplete(category=category_autocomplete)
+@app_commands.choices(platform=platform_choices)
+@app_commands.checks.has_permissions(administrator=True)
+async def checkaccess_cmd(interaction: discord.Interaction, category: str, contact: str,
+                          platform: app_commands.Choice[str] = None):
+    platforms = [platform.value] if platform else list(PLATFORMS.keys())
+    await run_category_action(
+        interaction, "check", category, contact, platforms,
+        {"progress": "Checking", "done": "Access Check", "unit": "found"},
+    )
+
+
+@tree.command(name="revoke", description="Revoke a whole category from a customer")
+@app_commands.describe(
+    category="The category to revoke (every access inside it)",
+    platform="Leave empty to revoke on ALL platforms",
+    contact="Customer's Discord ID",
+)
+@app_commands.autocomplete(category=category_autocomplete)
+@app_commands.choices(platform=platform_choices)
+@app_commands.checks.has_permissions(administrator=True)
+async def revoke_cmd(interaction: discord.Interaction, category: str, contact: str,
+                     platform: app_commands.Choice[str] = None):
+    platforms = [platform.value] if platform else list(PLATFORMS.keys())
+    await run_category_action(
+        interaction, "revoke", category, contact, platforms,
+        {"progress": "Revoking", "done": "Revoke", "unit": "revoked"},
+    )
 
 # ─────────────────────────────────────────────
 #  CROSS-PLATFORM ACCESS
@@ -2057,52 +2198,46 @@ async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str)
 #  L'identifiant utilisé est l'ID Discord de celui qui clique — c'est déjà la
 #  clé de partage côté Winsight comme côté Helios.
 
-CROSS_PLATFORM_TITLE = "🔀 Cross-Platform Access"
+CROSS_PLATFORM_TITLE = "🎫 Already Own It? Claim It Elsewhere"
+CROSS_PLATFORM_COLOR = 0xD4A017
 CROSS_PLATFORM_DESCRIPTION = (
-    "Already own a weight on one platform and want it on another too? "
-    "Press the button below or use `/cross-platform-access` right here in this channel.\n\n"
-    "**How it works:**\n"
-    "1️⃣ Pick the platform you currently own it on\n"
-    "2️⃣ We'll automatically check what you own\n"
-    "3️⃣ Pick the platform you'd like access on\n"
-    "4️⃣ Everything you own gets added there right away\n\n"
-    "ℹ️ Your existing access isn't touched or removed — this only adds access elsewhere.\n\n"
-    "⚠️ Make sure your subscription is linked to **this** Discord account before starting."
+    "No ticket, no waiting. Tell us where you own it, we verify, and you're "
+    "granted access wherever you want it.\n\n"
+    "Nothing is moved and nothing is removed — we only add access."
 )
+CROSS_PLATFORM_FOOTER = "Run /cross-platform-access anywhere to do this again."
 
 
-async def get_owned_models(platform: str, discord_id: str) -> list[str]:
+async def get_owned_categories(platform: str, discord_id: str) -> list[str]:
     """
-    Modèles du catalogue que ce client possède sur `platform`.
+    Catégories dont le client possède au moins un accès sur `platform`.
 
-    On ne teste que les modèles présents dans products.json pour cette
-    plateforme : c'est le catalogue vendu, donc le seul périmètre pertinent.
+    On s'arrête au premier membre trouvé : posséder une version d'un jeu suffit
+    à considérer la catégorie comme acquise.
     """
-    products = load_products()
-    candidates = [m for m in products if platform in products.get(m, {})]
     owned = []
-
-    for model_name in candidates:
-        if platform == "winsight":
-            try:
-                weight = await winsight.find_weight(model_name)
-            except WinsightError:
-                continue  # pas (encore) sur le portail, ou nom ambigu
-            if await winsight.has_share(weight["id"], discord_id):
-                owned.append(model_name)
-        else:
-            ok, _ = await helios_check(discord_id, model_name)
+    for name in load_categories():
+        for member in get_category_members(name, platform):
+            ok, _ = await apply_member("check", platform, discord_id, member)
             if ok:
-                owned.append(model_name)
-
+                owned.append(name)
+                break
     return owned
 
 
-async def grant_model_on_platform(platform: str, discord_id: str, model_name: str) -> tuple[bool, str]:
-    if platform == "winsight":
-        return await winsight_grant(discord_id, model_name)
-    return await helios_grant(discord_id, model_name)
-
+async def grant_category_on_platform(platform: str, discord_id: str, category: str) -> tuple[int, int, list[str]]:
+    """Grant tous les membres d'une catégorie sur une plateforme."""
+    nb_ok = 0
+    lines = []
+    members = get_category_members(category, platform)
+    for member in members:
+        ok, msg = await apply_member("grant", platform, discord_id, member)
+        lines.append(f"{'✓' if ok else '✗'} **{member_label(member, platform)}**")
+        if not ok:
+            print(f"[CrossPlatform] Grant failed {member['id']} on {platform}: {msg}")
+        else:
+            nb_ok += 1
+    return nb_ok, len(members) - nb_ok, lines
 
 def _platform_options(keys) -> list[discord.SelectOption]:
     return [
@@ -2130,7 +2265,7 @@ class CrossPlatformSourceSelect(discord.ui.Select):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
-            owned = await get_owned_models(source, discord_id)
+            owned = await get_owned_categories(source, discord_id)
         except Exception as e:
             print(f"[CrossPlatform] Ownership check failed on {source}: {e}")
             await interaction.followup.send(
@@ -2149,17 +2284,16 @@ class CrossPlatformSourceSelect(discord.ui.Select):
             )
             return
 
-        products = load_products()
         targets = [
             key for key in PLATFORMS
-            if key != source and any(key in products.get(m, {}) for m in owned)
+            if key != source and any(get_category_members(c, key) for c in owned)
         ]
 
-        found = "\n".join(f"● **{get_display_name(m)}**" for m in owned)
+        found = "\n".join(f"● **{c}**" for c in owned)
 
         if not targets:
             await interaction.followup.send(
-                f"✅ You own **{len(owned)}** weight(s) on {platform_label(source)}:\n{found}\n\n"
+                f"✅ You own **{len(owned)}** categor{'y' if len(owned) == 1 else 'ies'} on {platform_label(source)}:\n{found}\n\n"
                 "❌ None of them are available on another platform, so there's nothing to transfer.",
                 ephemeral=True,
             )
@@ -2168,8 +2302,8 @@ class CrossPlatformSourceSelect(discord.ui.Select):
         view = discord.ui.View(timeout=300)
         view.add_item(CrossPlatformTargetSelect(source, owned, targets))
         await interaction.followup.send(
-            f"**Step 2 of 2** — Found **{len(owned)}** weight(s) on {platform_label(source)}:\n{found}\n\n"
-            "Where would you like access?",
+            f"Found **{len(owned)}** categor{'y' if len(owned) == 1 else 'ies'} on {platform_label(source)}:\n{found}\n\n"
+            "**Where would you like access?**",
             view=view,
             ephemeral=True,
         )
@@ -2191,20 +2325,17 @@ class CrossPlatformTargetSelect(discord.ui.Select):
         discord_id = str(interaction.user.id)
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        products = load_products()
-        todo = [m for m in self.owned if target in products.get(m, {})]
-
         lines = []
         nb_ok = 0
-        for model_name in todo:
-            ok, msg = await grant_model_on_platform(target, discord_id, model_name)
-            lines.append(f"{'✓' if ok else '✗'} **{get_display_name(model_name)}**")
-            if ok:
-                nb_ok += 1
-            else:
-                print(f"[CrossPlatform] Grant failed {model_name} on {target}: {msg}")
-
-        nb_fail = len(todo) - nb_ok
+        nb_fail = 0
+        for category in self.owned:
+            ok_n, fail_n, member_lines = await grant_category_on_platform(target, discord_id, category)
+            if not member_lines:
+                continue
+            lines.append(f"__{category}__")
+            lines.extend(member_lines)
+            nb_ok += ok_n
+            nb_fail += fail_n
         all_ok = nb_fail == 0 and nb_ok > 0
 
         embed = discord.Embed(
@@ -2213,7 +2344,7 @@ class CrossPlatformTargetSelect(discord.ui.Select):
                 f"**{platform_label(self.source)}** → **{platform_label(target)}**\n\n"
                 + "\n".join(lines)
             ),
-            color=0x57F287 if all_ok else (0xF1C40F if nb_ok else 0xED4245),
+            color=CROSS_PLATFORM_COLOR if all_ok else (0xF1C40F if nb_ok else 0xED4245),
         )
         embed.add_field(name="Result", value=f"{nb_ok} added, {nb_fail} failed", inline=False)
         if nb_ok:
@@ -2243,15 +2374,15 @@ class CrossPlatformTargetSelect(discord.ui.Select):
 
 
 async def start_cross_platform(interaction: discord.Interaction):
-    if not load_products():
+    if not load_categories():
         await interaction.response.send_message(
-            "⚠️ No products are configured yet. Ask an admin to set them up.", ephemeral=True
+            "⚠️ Nothing is configured yet. Ask an admin to set up the categories.", ephemeral=True
         )
         return
     view = discord.ui.View(timeout=300)
     view.add_item(CrossPlatformSourceSelect())
     await interaction.response.send_message(
-        "**Step 1 of 2** — Which platform do you currently own the weight on?",
+        "**Where do you already own it?**",
         view=view,
         ephemeral=True,
     )
@@ -2262,9 +2393,9 @@ class CrossPlatformPanelView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Cross-Platform Access",
-        emoji="🔀",
-        style=discord.ButtonStyle.primary,
+        label="Get started",
+        emoji="🎫",
+        style=discord.ButtonStyle.success,
         custom_id="cross_platform_start",
     )
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2282,12 +2413,18 @@ async def crossplatformpanel_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title=CROSS_PLATFORM_TITLE,
         description=CROSS_PLATFORM_DESCRIPTION,
-        color=0x5865F2,
+        color=CROSS_PLATFORM_COLOR,
     )
-    platforms = " • ".join(f"{cfg['emoji']} {cfg['label']}" for cfg in PLATFORMS.values())
-    embed.add_field(name="Supported platforms", value=platforms, inline=False)
+    platforms = "\u2003".join(f"{cfg['emoji']} **{cfg['label']}**" for cfg in PLATFORMS.values())
+    embed.add_field(name="Platforms", value=platforms, inline=False)
+    embed.add_field(
+        name="⚠️ Before you start",
+        value="Your subscription must be linked to **this** Discord account.",
+        inline=False,
+    )
+    embed.set_footer(text=CROSS_PLATFORM_FOOTER)
     await interaction.channel.send(embed=embed, view=CrossPlatformPanelView())
-    await interaction.response.send_message("✅ Cross-platform panel posted!", ephemeral=True)
+    await interaction.response.send_message("✅ CroAss-platform panel posted!", ephemeral=True)
 
 
 # ─────────────────────────────────────────────
