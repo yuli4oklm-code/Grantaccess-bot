@@ -169,6 +169,33 @@ def member_label(member: dict, platform: str) -> str:
     return mid[:8] + "…" if len(mid) > 12 else mid
 
 
+def parse_member_values(raw: str, default_label: str = None) -> list[dict]:
+    """
+    Découpe une saisie libre en membres.
+
+    Séparateurs : retour à la ligne, virgule, point-virgule. Chaque entrée peut
+    porter son propre libellé avec `id=Label`. Sans `=`, on autorise aussi
+    plusieurs ids séparés par des espaces (les labels, eux, peuvent en contenir).
+
+        6cabf1d2=Valorant V1, 7dbcf2e3=Valorant V2
+        6cabf1d2 7dbcf2e3 8ecdf3f4
+    """
+    members = []
+    for chunk in re.split(r"[,;\n]+", raw or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" in chunk:
+            mid, _, lbl = chunk.partition("=")
+            mid, lbl = mid.strip(), lbl.strip()
+            if mid:
+                members.append({"id": mid, "label": lbl or default_label})
+        else:
+            for mid in chunk.split():
+                members.append({"id": mid, "label": default_label})
+    return members
+
+
 def add_category_member(category: str, platform: str, value: str, label: str = None) -> tuple[bool, str]:
     """Ajoute un membre. Retourne (créé_ou_maj, message)."""
     categories = load_categories()
@@ -1955,46 +1982,82 @@ async def category_member_autocomplete(interaction: discord.Interaction, current
 @tree.command(name="categoryadd", description="Add an access to a category (creates it if new)")
 @app_commands.describe(
     category="Category name, e.g. Valorant",
-    platform="Which platform this access lives on",
-    value="Winsight: the weight name — Aim Engine / Cubism: the item UUID",
-    label="Optional display name, e.g. Valorant V1",
+    platform="Which platform these accesses live on",
+    value="One or more, comma-separated. Optional per-item name with id=Label",
+    label="Fallback display name for entries without their own",
 )
 @app_commands.autocomplete(category=category_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def categoryadd_cmd(interaction: discord.Interaction, category: str,
                           platform: app_commands.Choice[str], value: str, label: str = None):
-    changed, note = add_category_member(category, platform.value, value, label)
+    entries = parse_member_values(value, label)
+    if not entries:
+        await interaction.response.send_message("⚠️ No value provided.", ephemeral=True)
+        return
+
+    added, updated, skipped = [], [], []
+    for entry in entries:
+        changed, note = add_category_member(category, platform.value, entry["id"], entry["label"])
+        if not changed:
+            skipped.append(entry["id"])
+        elif note == "label updated":
+            updated.append(entry["id"])
+        else:
+            added.append(entry["id"])
+
     canonical, _ = find_category(category)
-    icon = "✅" if changed else "⚠️"
-    await interaction.response.send_message(
-        f"{icon} **{canonical}** / {platform.name} → `{value.strip()}` ({note}).",
-        ephemeral=True,
+    total = len(get_category_members(canonical, platform.value)) if canonical else 0
+
+    lines = []
+    if added:
+        lines.append(f"✅ **{len(added)}** added")
+    if updated:
+        lines.append(f"✏️ **{len(updated)}** label(s) updated")
+    if skipped:
+        lines.append(f"⚠️ **{len(skipped)}** already there")
+
+    embed = discord.Embed(
+        title=f"📂 {canonical or category} — {platform.name}",
+        description="\n".join(lines) or "Nothing changed.",
+        color=EMBED_COLOR if added or updated else 0xF1C40F,
     )
-    if changed:
+    detail = "\n".join(
+        f"● **{member_label(m, platform.value)}** — `{m['id']}`"
+        for m in get_category_members(canonical or category, platform.value)
+    )
+    if detail:
+        embed.add_field(name=f"Now in this category ({total})", value=detail[:1024], inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    if added or updated:
         await backup_config_to_discord("categoryadd")
 
 
 @tree.command(name="categoryremove", description="Remove one access from a category")
 @app_commands.describe(
     category="Category to edit",
-    platform="Platform the access is on",
-    value="The weight name or item UUID to remove",
+    platform="Platform the accesses are on",
+    value="One or more weight names / item UUIDs, comma-separated",
 )
 @app_commands.autocomplete(category=category_autocomplete, value=category_member_autocomplete)
 @app_commands.choices(platform=platform_choices)
 @app_commands.checks.has_permissions(administrator=True)
 async def categoryremove_cmd(interaction: discord.Interaction, category: str,
                              platform: app_commands.Choice[str], value: str):
-    if remove_category_member(category, platform.value, value):
-        await interaction.response.send_message(
-            f"🚫 Removed `{value}` from **{category}** / {platform.name}.", ephemeral=True
-        )
+    entries = parse_member_values(value)
+    removed = [e["id"] for e in entries if remove_category_member(category, platform.value, e["id"])]
+    missing = [e["id"] for e in entries if e["id"] not in removed]
+
+    parts = []
+    if removed:
+        parts.append(f"🚫 **{len(removed)}** removed from **{category}** / {platform.name}")
+    if missing:
+        parts.append(f"⚠️ **{len(missing)}** not found: " + ", ".join(f"`{m}`" for m in missing[:5]))
+
+    await interaction.response.send_message("\n".join(parts) or "⚠️ No value provided.", ephemeral=True)
+    if removed:
         await backup_config_to_discord("categoryremove")
-    else:
-        await interaction.response.send_message(
-            f"⚠️ `{value}` isn't in **{category}** / {platform.name}.", ephemeral=True
-        )
 
 
 @tree.command(name="categorydelete", description="Delete a whole category")
@@ -2424,7 +2487,7 @@ async def crossplatformpanel_cmd(interaction: discord.Interaction):
     )
     embed.set_footer(text=CROSS_PLATFORM_FOOTER)
     await interaction.channel.send(embed=embed, view=CrossPlatformPanelView())
-    await interaction.response.send_message("✅ CroAss-platform panel posted!", ephemeral=True)
+    await interaction.response.send_message("✅ Cross-platform panel posted!", ephemeral=True)
 
 
 # ─────────────────────────────────────────────
