@@ -1983,13 +1983,68 @@ def _extract_name(body):
     return None
 
 
+_HELIOS_ITEMS_INDEX = None
+
+
+def _extract_item_id(item):
+    """Identifiant d'un item dans une réponse de liste."""
+    if not isinstance(item, dict):
+        return None
+    for field in ("id", "uuid", "item_id", "resource_id", "itemId"):
+        value = item.get(field)
+        if value:
+            return str(value)
+    return None
+
+
+async def helios_items_index() -> dict:
+    """
+    Index {uuid: nom} de tous les items Helios, construit une seule fois.
+
+    Sert de repli quand la fiche individuelle ne donne pas de nom : lister
+    fonctionne souvent là où le détail n'existe pas.
+    """
+    global _HELIOS_ITEMS_INDEX
+    if _HELIOS_ITEMS_INDEX is not None:
+        return _HELIOS_ITEMS_INDEX
+
+    index = {}
+    if HELIOS_API_KEY:
+        try:
+            url = f"{HELIOS_API_URL}?route=items&limit=500&offset=0"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=_helios_headers(False),
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    body = await resp.json(content_type=None)
+                    items = body.get("data") if isinstance(body, dict) else body
+                    if isinstance(items, dict):
+                        items = items.get("items") or items.get("results") or []
+                    if isinstance(items, list):
+                        for item in items:
+                            item_id = _extract_item_id(item)
+                            item_name = _extract_name(item)
+                            if item_id and item_name:
+                                index[item_id] = item_name
+                    if index:
+                        print(f"[Helios] Items index built: {len(index)} item(s)")
+                    else:
+                        print(f"[Helios] Could not build items index: {resp.status} {str(body)[:600]}")
+        except Exception as e:
+            print(f"[Helios] Items index failed: {e}")
+
+    _HELIOS_ITEMS_INDEX = index
+    return index
+
+
 async def helios_item_name(resource_id: str):
     """Nom réel d'un item Helios. None si l'API ne le donne pas."""
     key = ("helios", resource_id)
     if key in _NAME_CACHE:
         return _NAME_CACHE[key]
+
     name = None
     if HELIOS_API_KEY:
+        # 1) fiche individuelle
         try:
             url = f"{HELIOS_API_URL}?route=items/{resource_id}"
             async with aiohttp.ClientSession() as session:
@@ -1998,9 +2053,15 @@ async def helios_item_name(resource_id: str):
                     body = await resp.json(content_type=None)
                     name = _extract_name(body)
                     if not name:
-                        print(f"[Helios] No name field for item {resource_id}: {resp.status} {body}")
+                        print(f"[Helios] No name in item detail {resource_id}: "
+                              f"{resp.status} {str(body)[:600]}")
         except Exception as e:
-            print(f"[Helios] Item name lookup failed for {resource_id}: {e}")
+            print(f"[Helios] Item detail failed for {resource_id}: {e}")
+
+        # 2) repli : index global
+        if not name:
+            name = (await helios_items_index()).get(str(resource_id))
+
     _NAME_CACHE[key] = name
     return name
 
