@@ -1953,6 +1953,90 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
 
 
 # ─────────────────────────────────────────────
+#  RÉSOLUTION DES NOMS RÉELS
+# ─────────────────────────────────────────────
+#
+#  Plutôt que de faire saisir un libellé à la main pour chaque accès, on
+#  demande son vrai nom à la plateforme. Résultat mis en cache : un rapport
+#  de 10 lignes ne doit pas déclencher 10 appels à chaque fois.
+
+_NAME_CACHE = {}
+
+
+def _extract_name(body):
+    """
+    Cherche un champ de nom dans une réponse API, quelle que soit sa forme.
+    On ne connaît pas le schéma exact d'InputSense, donc on reste tolérant.
+    """
+    data = body
+    if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)):
+        data = data["data"]
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict):
+        return None
+    for field in ("name", "title", "label", "item_name", "display_name",
+                  "file_name", "filename"):
+        value = data.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+async def helios_item_name(resource_id: str):
+    """Nom réel d'un item Helios. None si l'API ne le donne pas."""
+    key = ("helios", resource_id)
+    if key in _NAME_CACHE:
+        return _NAME_CACHE[key]
+    name = None
+    if HELIOS_API_KEY:
+        try:
+            url = f"{HELIOS_API_URL}?route=items/{resource_id}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=_helios_headers(False),
+                                       timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    body = await resp.json(content_type=None)
+                    name = _extract_name(body)
+                    if not name:
+                        print(f"[Helios] No name field for item {resource_id}: {resp.status} {body}")
+        except Exception as e:
+            print(f"[Helios] Item name lookup failed for {resource_id}: {e}")
+    _NAME_CACHE[key] = name
+    return name
+
+
+async def winsight_weight_name(weight_ref: str):
+    """Nom de fichier réel d'un weight Winsight. None si introuvable."""
+    key = ("winsight", weight_ref)
+    if key in _NAME_CACHE:
+        return _NAME_CACHE[key]
+    name = None
+    try:
+        weight = await winsight.find_weight(weight_ref)
+        name = weight.get("fileName")
+    except Exception as e:
+        print(f"[Winsight] Name lookup failed for {weight_ref}: {e}")
+    _NAME_CACHE[key] = name
+    return name
+
+
+async def resolve_member_label(member: dict, platform: str) -> str:
+    """Libellé d'un membre : label explicite > nom réel via API > repli."""
+    explicit = (member.get("label") or "").strip()
+    if explicit:
+        return explicit
+
+    mid = str(member.get("id", ""))
+    if platform == "helios":
+        real = await helios_item_name(mid)
+    else:
+        real = await winsight_weight_name(mid)
+
+    if real:
+        return real[:-5] if real.lower().endswith(".onnx") else real
+    return member_label(member, platform)
+
+# ─────────────────────────────────────────────
 #  COMMANDES CATÉGORIES (admin)
 # ─────────────────────────────────────────────
 
@@ -1996,6 +2080,9 @@ async def categoryadd_cmd(interaction: discord.Interaction, category: str,
         await interaction.response.send_message("⚠️ No value provided.", ephemeral=True)
         return
 
+    # La résolution des noms passe par les API : on prend le temps qu'il faut.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     added, updated, skipped = [], [], []
     for entry in entries:
         changed, note = add_category_member(category, platform.value, entry["id"], entry["label"])
@@ -2022,13 +2109,13 @@ async def categoryadd_cmd(interaction: discord.Interaction, category: str,
         description="\n".join(lines) or "Nothing changed.",
         color=EMBED_COLOR if added or updated else 0xF1C40F,
     )
-    detail = "\n".join(
-        f"● **{member_label(m, platform.value)}** — `{m['id']}`"
-        for m in get_category_members(canonical or category, platform.value)
-    )
-    if detail:
-        embed.add_field(name=f"Now in this category ({total})", value=detail[:1024], inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    rows = []
+    for m in get_category_members(canonical or category, platform.value):
+        rows.append(f"● **{await resolve_member_label(m, platform.value)}** — `{m['id']}`")
+    if rows:
+        embed.add_field(name=f"Now in this category ({total})",
+                        value="\n".join(rows)[:1024], inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
     if added or updated:
         await backup_config_to_discord("categoryadd")
@@ -2087,19 +2174,21 @@ async def categories_cmd(interaction: discord.Interaction, category: str = None)
         )
         return
 
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     if category:
         canonical, data = find_category(category)
         if not canonical:
-            await interaction.response.send_message(f"⚠️ Category **{category}** not found.", ephemeral=True)
+            await interaction.followup.send(f"⚠️ Category **{category}** not found.", ephemeral=True)
             return
         embed = discord.Embed(title=f"📂 {canonical}", color=EMBED_COLOR)
         for key, cfg in PLATFORMS.items():
-            members = get_category_members(canonical, key)
-            value = "\n".join(
-                f"● **{member_label(m, key)}** — `{m['id']}`" for m in members
-            ) or "*none*"
-            embed.add_field(name=f"{cfg['emoji']} {cfg['label']}", value=value, inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            rows = []
+            for m in get_category_members(canonical, key):
+                rows.append(f"● **{await resolve_member_label(m, key)}** — `{m['id']}`")
+            embed.add_field(name=f"{cfg['emoji']} {cfg['label']}",
+                            value="\n".join(rows)[:1024] or "*none*", inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
     embed = discord.Embed(title="📂 Categories", color=EMBED_COLOR)
@@ -2110,7 +2199,7 @@ async def categories_cmd(interaction: discord.Interaction, category: str = None)
         )
         embed.add_field(name=name, value=counts, inline=False)
     embed.set_footer(text="Use /categories <name> to see the details.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ─────────────────────────────────────────────
 #  GRANT / CHECK / REVOKE (par catégorie)
@@ -2183,7 +2272,8 @@ async def run_category_action(interaction: discord.Interaction, action: str, cat
         nb_ok = 0
         for key, member in jobs:
             ok, msg = await apply_member(action, key, contact, member)
-            results.setdefault(key, []).append((ok, member_label(member, key), msg))
+            label = await resolve_member_label(member, key)
+            results.setdefault(key, []).append((ok, label, msg))
             if ok:
                 nb_ok += 1
 
@@ -2323,7 +2413,7 @@ async def grant_category_on_platform(platform: str, discord_id: str, category: s
     members = get_category_members(category, platform)
     for member in members:
         ok, msg = await apply_member("grant", platform, discord_id, member)
-        lines.append(f"{'✓' if ok else '✗'} **{member_label(member, platform)}**")
+        lines.append(f"{'✓' if ok else '✗'} **{await resolve_member_label(member, platform)}**")
         if not ok:
             print(f"[CrossPlatform] Grant failed {member['id']} on {platform}: {msg}")
         else:
