@@ -2140,6 +2140,14 @@ async def apply_member(action: str, platform: str, contact: str, member: dict) -
     return await winsight_revoke(contact, mid)
 
 
+def short_reason(msg: str) -> str:
+    """Message d'API condensé pour tenir sur une ligne (emoji de tête retiré)."""
+    text = re.sub(r"^[^\w]+", "", str(msg or "")).strip()
+    if not text:
+        return "unknown error"
+    return text[:110] + "…" if len(text) > 110 else text
+
+
 def category_jobs(category: str, platforms: list[str]) -> list[tuple[str, dict]]:
     """Liste (plateforme, membre) pour toutes les plateformes visées."""
     return [
@@ -2169,12 +2177,13 @@ async def run_category_action(interaction: discord.Interaction, action: str, cat
     )
 
     async def run():
-        lines = []
+        # Résultats groupés par plateforme : une section par plateforme, une
+        # ligne par accès. Le détail de l'API n'apparaît qu'en cas d'échec.
+        results = {}
         nb_ok = 0
         for key, member in jobs:
             ok, msg = await apply_member(action, key, contact, member)
-            mark = "✓" if ok else "✗"
-            lines.append(f"{mark} `{platform_label(key)}` **{member_label(member, key)}** — {msg}")
+            results.setdefault(key, []).append((ok, member_label(member, key), msg))
             if ok:
                 nb_ok += 1
 
@@ -2182,10 +2191,29 @@ async def run_category_action(interaction: discord.Interaction, action: str, cat
         all_ok = nb_fail == 0
         embed = discord.Embed(
             title=f"{'✅' if all_ok else ('⚠️' if nb_ok else '❌')} {titles['done']} — {category}",
-            description="\n".join(lines)[:4000],
+            description=f"Customer <@{contact}> · `{contact}`",
             color=0x57F287 if all_ok else (0xF1C40F if nb_ok else 0xED4245),
         )
-        embed.add_field(name="Result", value=f"{nb_ok} {titles['unit']}, {nb_fail} failed", inline=False)
+        for key, rows in results.items():
+            body = []
+            for ok, label, msg in rows:
+                # Sur un check, "échec" veut juste dire "pas d'accès" : le
+                # message de l'API n'apporte rien de plus que la croix.
+                if ok or action == "check":
+                    body.append(f"{'✓' if ok else '✗'} {label}")
+                else:
+                    body.append(f"✗ {label} — {short_reason(msg)}")
+            emoji = PLATFORMS.get(key, {}).get("emoji", "")
+            embed.add_field(
+                name=f"{emoji} {platform_label(key)}",
+                value="\n".join(body)[:1024],
+                inline=False,
+            )
+        embed.add_field(
+            name="Result",
+            value=f"**{nb_ok}** {titles['unit']} · **{nb_fail}** failed",
+            inline=False,
+        )
         embed.set_footer(text=f"{titles['done']} • by {interaction.user}")
 
         if titles.get("public"):
