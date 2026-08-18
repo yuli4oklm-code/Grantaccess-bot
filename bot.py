@@ -36,6 +36,10 @@ WINSIGHT_URL = os.environ.get("WINSIGHT_URL", "https://winsight.info/px3-8kd4b7e
 HELIOS_API_KEY = os.environ.get("HELIOS_API_KEY", "")
 HELIOS_RESOURCE_ID = os.environ.get("HELIOS_RESOURCE_ID", "6cabf1d2-8887-4b36-885d-e888b82f7987")
 HELIOS_API_URL = "https://www.inputsense.com/api/scripts/integration_v1.php"
+# Route de lecture du catalogue Helios. Au 2026-08-18 InputSense n'en expose
+# aucune (404 "Route not found") : les noms viennent donc des labels saisis.
+# Si tu en trouves une dans leur doc, mets-la ici sans redéployer de code.
+HELIOS_ITEMS_ROUTE = os.environ.get("HELIOS_ITEMS_ROUTE", "items").strip()
 
 # Valeurs par défaut (serveur principal). Chaque serveur peut les surcharger avec /setup.
 STAFF_CHANNEL_ID = int(os.environ.get("STAFF_CHANNEL_ID", "0")) or None
@@ -1984,6 +1988,15 @@ def _extract_name(body):
 
 
 _HELIOS_ITEMS_INDEX = None
+# Passe à True au premier 404 : inutile de retenter à chaque affichage.
+_HELIOS_NAMES_UNAVAILABLE = False
+
+
+def _helios_route_missing(status: int, body) -> bool:
+    if status != 404:
+        return False
+    error = body.get("error", {}) if isinstance(body, dict) else {}
+    return error.get("code") == "not_found"
 
 
 def _extract_item_id(item):
@@ -2008,10 +2021,11 @@ async def helios_items_index() -> dict:
     if _HELIOS_ITEMS_INDEX is not None:
         return _HELIOS_ITEMS_INDEX
 
+    global _HELIOS_NAMES_UNAVAILABLE
     index = {}
-    if HELIOS_API_KEY:
+    if HELIOS_API_KEY and not _HELIOS_NAMES_UNAVAILABLE:
         try:
-            url = f"{HELIOS_API_URL}?route=items&limit=500&offset=0"
+            url = f"{HELIOS_API_URL}?route={HELIOS_ITEMS_ROUTE}&limit=500&offset=0"
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=_helios_headers(False),
                                        timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -2027,6 +2041,10 @@ async def helios_items_index() -> dict:
                                 index[item_id] = item_name
                     if index:
                         print(f"[Helios] Items index built: {len(index)} item(s)")
+                    elif _helios_route_missing(resp.status, body):
+                        _HELIOS_NAMES_UNAVAILABLE = True
+                        print("[Helios] No catalogue route on this API — falling back to "
+                              "manual labels. Set HELIOS_ITEMS_ROUTE if yours exposes one.")
                     else:
                         print(f"[Helios] Could not build items index: {resp.status} {str(body)[:600]}")
         except Exception as e:
@@ -2042,17 +2060,18 @@ async def helios_item_name(resource_id: str):
     if key in _NAME_CACHE:
         return _NAME_CACHE[key]
 
+    global _HELIOS_NAMES_UNAVAILABLE
     name = None
-    if HELIOS_API_KEY:
+    if HELIOS_API_KEY and not _HELIOS_NAMES_UNAVAILABLE:
         # 1) fiche individuelle
         try:
-            url = f"{HELIOS_API_URL}?route=items/{resource_id}"
+            url = f"{HELIOS_API_URL}?route={HELIOS_ITEMS_ROUTE}/{resource_id}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=_helios_headers(False),
                                        timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     body = await resp.json(content_type=None)
                     name = _extract_name(body)
-                    if not name:
+                    if not name and not _helios_route_missing(resp.status, body):
                         print(f"[Helios] No name in item detail {resource_id}: "
                               f"{resp.status} {str(body)[:600]}")
         except Exception as e:
@@ -2206,6 +2225,36 @@ async def categoryremove_cmd(interaction: discord.Interaction, category: str,
     await interaction.response.send_message("\n".join(parts) or "⚠️ No value provided.", ephemeral=True)
     if removed:
         await backup_config_to_discord("categoryremove")
+
+
+@tree.command(name="categorylabel", description="Rename an entry so reports show a real name")
+@app_commands.describe(
+    category="Category the entry belongs to",
+    platform="Platform the entry is on",
+    value="The entry to rename (pick it from the list)",
+    label="Name to display, e.g. XyCubValorantV1",
+)
+@app_commands.autocomplete(category=category_autocomplete, value=category_member_autocomplete)
+@app_commands.choices(platform=platform_choices)
+@app_commands.checks.has_permissions(administrator=True)
+async def categorylabel_cmd(interaction: discord.Interaction, category: str,
+                            platform: app_commands.Choice[str], value: str, label: str):
+    canonical, _ = find_category(category)
+    members = get_category_members(canonical or category, platform.value)
+    target = value.strip().lower()
+    match = next((m for m in members if str(m.get("id", "")).strip().lower() == target), None)
+
+    if not match:
+        await interaction.response.send_message(
+            f"⚠️ `{value}` isn't in **{category}** / {platform.name}.", ephemeral=True
+        )
+        return
+
+    add_category_member(canonical or category, platform.value, match["id"], label)
+    await interaction.response.send_message(
+        f"✏️ `{match['id']}` is now shown as **{label.strip()}**.", ephemeral=True
+    )
+    await backup_config_to_discord("categorylabel")
 
 
 @tree.command(name="categorydelete", description="Delete a whole category")
