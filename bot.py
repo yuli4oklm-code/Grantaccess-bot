@@ -1820,7 +1820,8 @@ def _helios_authorized_ids(body) -> list[str]:
     """
     data = body.get("data") if isinstance(body, dict) else body
     if isinstance(data, dict):
-        for field in ("users", "authorized_users", "items", "results", "data"):
+        for field in ("authorizations", "authorized_users", "users",
+                      "items", "results", "data"):
             if isinstance(data.get(field), list):
                 data = data[field]
                 break
@@ -1834,6 +1835,10 @@ def _helios_authorized_ids(body) -> list[str]:
             continue
         if not isinstance(user, dict):
             continue
+        # Le grant renvoie l'objet sous une clé "authorization" : la liste
+        # peut faire pareil pour chaque entrée.
+        if isinstance(user.get("authorization"), dict):
+            user = user["authorization"]
         for field in ("discord_id", "discordId", "discord_user_id", "user_id", "id", "discord"):
             value = user.get(field)
             if value not in (None, ""):
@@ -1865,10 +1870,14 @@ async def helios_check(discord_id: str, model_name: str = None,
                 if wanted in ids:
                     return True, f"✅ `{discord_id}` has access to **{label}**."
 
-                # Aucun identifiant lisible alors que l'appel a réussi : c'est
-                # probablement un schéma qu'on ne sait pas encore lire.
-                if not ids:
-                    print(f"[Helios] No authorized user parsed for item {rid}: {str(body)[:600]}")
+                # Tout check négatif est loggé : soit le schéma n'est pas lu
+                # (ids vide), soit l'utilisateur n'y est vraiment pas.
+                if ids:
+                    print(f"[Helios] Check {rid}: {wanted} not among {len(ids)} "
+                          f"authorized id(s) {ids[:10]}")
+                else:
+                    print(f"[Helios] Check {rid}: could not parse any id from "
+                          f"{str(body)[:600]}")
                 return False, f"❌ `{discord_id}` does NOT have access to **{label}**."
     except Exception as e:
         print(f"[Helios] Check exception for item {rid}: {e}")
