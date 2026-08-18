@@ -1811,6 +1811,37 @@ async def helios_revoke(discord_id: str, model_name: str = None,
         return False, f"Error: {str(e)}"
 
 
+def _helios_authorized_ids(body) -> list[str]:
+    """
+    Extrait les identifiants Discord d'une réponse authorized-users.
+
+    Le schéma exact d'InputSense n'est pas documenté : on accepte une liste à
+    la racine, sous `data`, ou imbriquée, et plusieurs noms de champ.
+    """
+    data = body.get("data") if isinstance(body, dict) else body
+    if isinstance(data, dict):
+        for field in ("users", "authorized_users", "items", "results", "data"):
+            if isinstance(data.get(field), list):
+                data = data[field]
+                break
+    if not isinstance(data, list):
+        return []
+
+    ids = []
+    for user in data:
+        if isinstance(user, (str, int)):
+            ids.append(str(user).strip())
+            continue
+        if not isinstance(user, dict):
+            continue
+        for field in ("discord_id", "discordId", "discord_user_id", "user_id", "id", "discord"):
+            value = user.get(field)
+            if value not in (None, ""):
+                ids.append(str(value).strip())
+                break
+    return ids
+
+
 async def helios_check(discord_id: str, model_name: str = None,
                       resource_id: str = None) -> tuple[bool, str]:
     """Check if a user has access via Helios/InputSense API."""
@@ -1827,12 +1858,20 @@ async def helios_check(discord_id: str, model_name: str = None,
                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 body = await resp.json(content_type=None)
                 if not (isinstance(body, dict) and body.get("success")):
-                    return False, f"❌ Helios API error: {body}"
-                for user in body.get("data", []):
-                    if str(user.get("discord_id", "")).strip() == wanted:
-                        return True, f"✅ `{discord_id}` has access to **{label}**."
+                    print(f"[Helios] Check failed for item {rid}: {resp.status} {str(body)[:600]}")
+                    return False, f"❌ Helios API error: {_helios_error(body)}"
+
+                ids = _helios_authorized_ids(body)
+                if wanted in ids:
+                    return True, f"✅ `{discord_id}` has access to **{label}**."
+
+                # Aucun identifiant lisible alors que l'appel a réussi : c'est
+                # probablement un schéma qu'on ne sait pas encore lire.
+                if not ids:
+                    print(f"[Helios] No authorized user parsed for item {rid}: {str(body)[:600]}")
                 return False, f"❌ `{discord_id}` does NOT have access to **{label}**."
     except Exception as e:
+        print(f"[Helios] Check exception for item {rid}: {e}")
         return False, f"Error: {str(e)}"
 
 async def process_paid_order(order_id: str):
@@ -2499,6 +2538,11 @@ CROSS_PLATFORM_DESCRIPTION = (
 CROSS_PLATFORM_FOOTER = "Run /cross-platform-access anywhere to do this again."
 
 
+def platform_is_configured(platform: str) -> bool:
+    """Au moins une catégorie a-t-elle une entrée sur cette plateforme ?"""
+    return any(get_category_members(name, platform) for name in load_categories())
+
+
 async def get_owned_categories(platform: str, discord_id: str) -> list[str]:
     """
     Catégories dont le client possède au moins un accès sur `platform`.
@@ -2555,6 +2599,17 @@ class CrossPlatformSourceSelect(discord.ui.Select):
         discord_id = str(interaction.user.id)
         await interaction.response.defer(ephemeral=True, thinking=True)
 
+        # Rien de déclaré sur cette plateforme : c'est un trou de configuration,
+        # pas un problème d'abonnement. Ne pas accuser le client à tort.
+        if not platform_is_configured(source):
+            print(f"[CrossPlatform] No category has any entry on {source} — check /categories.")
+            await interaction.followup.send(
+                f"⚠️ **{platform_label(source)}** isn't set up for transfers yet. "
+                "Please open a ticket so staff can sort it out.",
+                ephemeral=True,
+            )
+            return
+
         try:
             owned = await get_owned_categories(source, discord_id)
         except Exception as e:
@@ -2567,10 +2622,10 @@ class CrossPlatformSourceSelect(discord.ui.Select):
 
         if not owned:
             await interaction.followup.send(
-                f"❌ We couldn't find any weight you own on **{platform_label(source)}** "
-                f"for this Discord account (`{discord_id}`).\n\n"
-                "Make sure your subscription is linked to this account, then try again. "
-                "If you're sure it should be there, open a ticket.",
+                f"❌ Nothing found on **{platform_label(source)}** for this Discord account "
+                f"(`{discord_id}`).\n\n"
+                "This usually means your subscription is linked to a different Discord "
+                "account. Check that, then try again — or open a ticket and we'll look.",
                 ephemeral=True,
             )
             return
