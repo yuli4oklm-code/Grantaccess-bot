@@ -53,6 +53,7 @@ PRODUCTS_FILE = os.path.join(DATA_DIR, "winsight_products.json")
 PIPELINES_FILE = os.path.join(DATA_DIR, "winsight_pipelines.json")
 WEIGHTS_FILE = os.path.join(DATA_DIR, "weights.json")
 GUILDS_FILE = os.path.join(DATA_DIR, "guilds.json")
+HELIOS_RESOURCES_FILE = os.path.join(DATA_DIR, "helios_resources.json")
 
 EMBED_COLOR = 0x2F3136
 CONFIG_BACKUP_MARKER = "WINSIGHT_BOT_CONFIG_BACKUP_V1"
@@ -61,6 +62,22 @@ DEFAULT_PRODUCTS = {
     "XyCubValorantV2": {"winsight": 2000},
 }
 DEFAULT_PIPELINES = {}
+
+# ─────────────────────────────────────────────
+#  PLATEFORMES
+# ─────────────────────────────────────────────
+#  La cle est l'identifiant interne (utilise dans products.json et le code) ;
+#  le label est ce que voient les clients. Helios est le backend derriere
+#  Aim Engine et Cubism.
+
+PLATFORMS = {
+    "winsight": {"label": "Winsight", "emoji": "\U0001F451"},
+    "helios": {"label": "Aim Engine \u00b7 Cubism", "emoji": "\U0001F3AF"},
+}
+
+
+def platform_label(key: str) -> str:
+    return PLATFORMS.get(key, {}).get("label", str(key).capitalize())
 
 # ─────────────────────────────────────────────
 #  MAPPING NOM MODELE → DISPLAY NAME
@@ -171,6 +188,37 @@ def load_pipelines():
 def save_pipelines(data):
     save_json(PIPELINES_FILE, data)
 
+
+def load_helios_resources():
+    return load_json(HELIOS_RESOURCES_FILE, {})
+
+
+def save_helios_resources(data):
+    save_json(HELIOS_RESOURCES_FILE, data)
+
+
+def get_helios_resource(model_name: str):
+    """
+    Resource ID Helios d'un modèle. Retombe sur HELIOS_RESOURCE_ID (ressource
+    globale historique) si aucun mapping n'existe, pour ne pas casser les
+    modèles déjà en place.
+    """
+    if not model_name:
+        return HELIOS_RESOURCE_ID or None
+    resources = load_helios_resources()
+    if model_name in resources:
+        return resources[model_name]
+    target = normalize_weight_name(model_name)
+    for name, rid in resources.items():
+        if normalize_weight_name(name) == target:
+            return rid
+    return HELIOS_RESOURCE_ID or None
+
+
+def get_models_on_platform(group_name: str, platform: str) -> list[str]:
+    """Modèles d'un groupe (ex: « Valorant ») disponibles sur une plateforme."""
+    products = load_products()
+    return [m for m in get_models_for_group(group_name) if platform in products.get(m, {})]
 
 def load_weights():
     return load_json(WEIGHTS_FILE, {})
@@ -372,6 +420,8 @@ async def restore_config_from_discord():
         save_json(PRODUCTS_FILE, payload["products"])
     if "pipelines" in payload:
         save_pipelines(payload["pipelines"])
+    if "helios_resources" in payload:
+        save_helios_resources(payload["helios_resources"])
     print("[Config Backup] Restored products/pipelines from Discord backup.")
     return True
 
@@ -387,6 +437,7 @@ async def backup_config_to_discord(reason="manual update"):
         "reason": reason,
         "products": load_products(),
         "pipelines": load_pipelines(),
+        "helios_resources": load_helios_resources(),
     }
     content = f"{CONFIG_BACKUP_MARKER}\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
     if len(content) > 2000:
@@ -1108,6 +1159,7 @@ async def on_ready():
     await tree.sync()
     bot.add_view(OrderStartView())
     bot.add_view(TicketCloseView(0))
+    bot.add_view(CrossPlatformPanelView())
 
     # Ré-enregistrer les WeightViews persistantes
     weights = load_weights()
@@ -1201,8 +1253,8 @@ async def order_cmd(interaction: discord.Interaction):
 
 
 platform_choices = [
-    app_commands.Choice(name="Winsight", value="winsight"),
-    app_commands.Choice(name="Helios", value="helios"),
+    app_commands.Choice(name=PLATFORMS[key]["label"], value=key)
+    for key in PLATFORMS
 ]
 
 
@@ -1586,92 +1638,110 @@ async def winsight_revoke(discord_id: str, model_name: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────
 #  HELIOS / INPUTSENSE
 # ─────────────────────────────────────────────
+#
+#  Chaque modèle a son propre « item » Helios (un UUID). Le mapping
+#  modèle → resource_id vit dans helios_resources.json, alimenté par
+#  /setheliosresource. Sans mapping, on retombe sur HELIOS_RESOURCE_ID.
 
-async def helios_grant(discord_id: str, resource_id: str = None, notes: str = None) -> tuple[bool, str]:
-    """Grant access via Helios/InputSense API."""
-    rid = resource_id or HELIOS_RESOURCE_ID
+def _helios_headers(json_body: bool = True) -> dict:
+    headers = {"Authorization": f"Bearer {HELIOS_API_KEY}"}
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _helios_resolve(model_name, resource_id):
+    """Retourne (resource_id, erreur) — l'un des deux est None."""
     if not HELIOS_API_KEY:
-        return False, "❌ HELIOS_API_KEY not configured."
+        return None, "❌ HELIOS_API_KEY not configured."
+    rid = resource_id or get_helios_resource(model_name)
+    if not rid:
+        target = model_name or "this model"
+        return None, f"❌ No Helios resource ID configured for **{target}** (use `/setheliosresource`)."
+    return rid, None
+
+
+def _helios_error(body) -> str:
+    error = body.get("error", {}) if isinstance(body, dict) else {}
+    return f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
+
+
+async def helios_grant(discord_id: str, model_name: str = None, notes: str = None,
+                       resource_id: str = None) -> tuple[bool, str]:
+    """Grant access via Helios/InputSense API."""
+    rid, err = _helios_resolve(model_name, resource_id)
+    if err:
+        return False, err
 
     url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users"
-    headers = {
-        "Authorization": f"Bearer {HELIOS_API_KEY}",
-        "Content-Type": "application/json",
-    }
     payload = {
         "discord_id": str(discord_id),
-        "notes": notes or f"Granted via bot",
+        "notes": notes or "Granted via bot",
         "expires_at": None,
     }
-    print(f"[Helios] Grant: POST {url} discord_id={discord_id}")
+    label = model_name or "Helios"
+    print(f"[Helios] Grant: item={rid} model={model_name} discord_id={discord_id}")
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                status = resp.status
+            async with session.post(url, headers=_helios_headers(), json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 body = await resp.json(content_type=None)
-                print(f"[Helios] Response: {status} {body}")
-                if body.get("success"):
-                    return True, f"✅ Access granted to `{discord_id}` on Helios."
-                else:
-                    error = body.get("error", {})
-                    return False, f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
+                print(f"[Helios] Response: {resp.status} {body}")
+                if isinstance(body, dict) and body.get("success"):
+                    return True, f"✅ Access granted to `{discord_id}` for **{label}**."
+                return False, _helios_error(body)
     except Exception as e:
         print(f"[Helios] EXCEPTION: {e}")
         return False, f"Error: {str(e)}"
 
 
-async def helios_revoke(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
+async def helios_revoke(discord_id: str, model_name: str = None,
+                        resource_id: str = None) -> tuple[bool, str]:
     """Revoke access via Helios/InputSense API."""
-    rid = resource_id or HELIOS_RESOURCE_ID
-    if not HELIOS_API_KEY:
-        return False, "❌ HELIOS_API_KEY not configured."
+    rid, err = _helios_resolve(model_name, resource_id)
+    if err:
+        return False, err
 
     url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users/{discord_id}/revoke"
-    headers = {
-        "Authorization": f"Bearer {HELIOS_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    print(f"[Helios] Revoke: POST {url}")
+    label = model_name or "Helios"
+    print(f"[Helios] Revoke: item={rid} model={model_name} discord_id={discord_id}")
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json={}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                status = resp.status
+            async with session.post(url, headers=_helios_headers(), json={},
+                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 body = await resp.json(content_type=None)
-                print(f"[Helios] Response: {status} {body}")
-                if body.get("success"):
-                    return True, f"✅ Access revoked for `{discord_id}` on Helios."
-                else:
-                    error = body.get("error", {})
-                    return False, f"❌ Helios: {error.get('code', 'unknown')} — {error.get('message', str(body))}"
+                print(f"[Helios] Response: {resp.status} {body}")
+                if isinstance(body, dict) and body.get("success"):
+                    return True, f"✅ Access revoked for `{discord_id}` on **{label}**."
+                return False, _helios_error(body)
     except Exception as e:
         print(f"[Helios] EXCEPTION: {e}")
         return False, f"Error: {str(e)}"
 
 
-async def helios_check(discord_id: str, resource_id: str = None) -> tuple[bool, str]:
+async def helios_check(discord_id: str, model_name: str = None,
+                      resource_id: str = None) -> tuple[bool, str]:
     """Check if a user has access via Helios/InputSense API."""
-    rid = resource_id or HELIOS_RESOURCE_ID
-    if not HELIOS_API_KEY:
-        return False, "❌ HELIOS_API_KEY not configured."
+    rid, err = _helios_resolve(model_name, resource_id)
+    if err:
+        return False, err
 
+    label = model_name or "Helios"
+    wanted = str(discord_id).strip()
     url = f"{HELIOS_API_URL}?route=items/{rid}/authorized-users&limit=200&offset=0"
-    headers = {
-        "Authorization": f"Bearer {HELIOS_API_KEY}",
-    }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(url, headers=_helios_headers(False),
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 body = await resp.json(content_type=None)
-                if not body.get("success"):
+                if not (isinstance(body, dict) and body.get("success")):
                     return False, f"❌ Helios API error: {body}"
-                users = body.get("data", [])
-                for user in users:
-                    if str(user.get("discord_id", "")) == str(discord_id):
-                        return True, f"✅ `{discord_id}` has access on Helios."
-                return False, f"❌ `{discord_id}` does NOT have access on Helios."
+                for user in body.get("data", []):
+                    if str(user.get("discord_id", "")).strip() == wanted:
+                        return True, f"✅ `{discord_id}` has access to **{label}**."
+                return False, f"❌ `{discord_id}` does NOT have access to **{label}**."
     except Exception as e:
         return False, f"Error: {str(e)}"
-
 
 async def process_paid_order(order_id: str):
     order = get_order(order_id)
@@ -1681,7 +1751,7 @@ async def process_paid_order(order_id: str):
     platform = order.get("platform", "winsight")
 
     if platform == "helios":
-        success, message = await helios_grant(order["buyer_contact"])
+        success, message = await helios_grant(order["buyer_contact"], order["model"])
     else:
         success, message = await winsight_grant(order["buyer_contact"], order["model"])
 
@@ -1833,16 +1903,14 @@ async def pipelineadd_cmd(interaction: discord.Interaction, pipeline: str, disco
 async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform: app_commands.Choice[str], contact: str):
     group_name = model
 
-    # Helios n'a pas besoin d'être dans products.json — c'est une API directe
-    if platform.value != "helios":
-        available_platforms = get_platforms_for_group(group_name)
-        if platform.value not in available_platforms:
-            await interaction.response.send_message(
-                f"❌ **{group_name}** not configured on **{platform.name}**. "
-                f"Available: {', '.join(available_platforms) or 'none'}",
-                ephemeral=True,
-            )
-            return
+    available_platforms = get_platforms_for_group(group_name)
+    if platform.value not in available_platforms:
+        await interaction.response.send_message(
+            f"❌ **{group_name}** not configured on **{platform.name}**. "
+            f"Available: {', '.join(platform_label(p) for p in available_platforms) or 'none'}",
+            ephemeral=True,
+        )
+        return
 
     await interaction.response.send_message(
         f"⏳ Granting **{group_name}** on **{platform.name}** to `{contact}`...",
@@ -1851,18 +1919,23 @@ async def grantaccess_cmd(interaction: discord.Interaction, model: str, platform
 
     async def run():
         if platform.value == "helios":
-            # Helios : simple API call, un seul resource
-            ok, msg = await helios_grant(contact)
-            nb_ok = 1 if ok else 0
-            nb_fail = 0 if ok else 1
-            details = [f"{'✓' if ok else '✗'} Helios — {msg}"]
+            # Helios : un item par modèle, résolu via helios_resources.json
+            models = get_models_on_platform(group_name, "helios")
+            details = []
+            nb_ok = 0
+            for m in models:
+                ok, msg = await helios_grant(contact, m)
+                details.append(f"{'✓' if ok else '✗'} {get_display_name(m)} — {msg}")
+                if ok:
+                    nb_ok += 1
+            nb_fail = len(models) - nb_ok
         else:
             # Winsight : scraping dynamique
             nb_ok, nb_fail, details = await winsight_grant_all_dynamic(contact, group_name)
 
         all_ok = nb_fail == 0
         color = 0x57F287 if all_ok else (0xF1C40F if nb_ok > 0 else 0xED4245)
-        prefix = "HEL" if platform.value == "helios" else "WIN"
+        prefix = platform_label(platform.value)
 
         if all_ok:
             title = f"✅ {prefix} Granted — {group_name}"
@@ -1908,9 +1981,7 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
         )
         return
 
-    all_models = get_models_for_group(group_name)
-    products = load_products()
-    models_on_platform = [m for m in all_models if platform.value in products.get(m, {})]
+    models_on_platform = get_models_on_platform(group_name, platform.value)
 
     await interaction.response.send_message(
         f"⏳ Checking **{group_name}** ({len(models_on_platform)} version(s)) for `{contact}`...", ephemeral=True
@@ -1919,7 +1990,10 @@ async def checkaccess_cmd(interaction: discord.Interaction, model: str, platform
     async def run():
         lines = []
         for m in models_on_platform:
-            _, msg = await winsight_check(contact, m)
+            if platform.value == "helios":
+                _, msg = await helios_check(contact, m)
+            else:
+                _, msg = await winsight_check(contact, m)
             lines.append(f"**{get_display_name(m)}**: {msg}")
         embed = discord.Embed(
             title=f"🔍 Access Check — {group_name}",
@@ -1971,6 +2045,317 @@ async def revoke_cmd(interaction: discord.Interaction, model: str, contact: str)
 
     asyncio.create_task(run())
 
+
+# ─────────────────────────────────────────────
+#  CROSS-PLATFORM ACCESS
+# ─────────────────────────────────────────────
+#
+#  Le client clique un bouton, choisit la plateforme où il possède déjà le
+#  modèle, on vérifie via API ce qu'il possède réellement, puis il choisit la
+#  plateforme cible et on lui grant tout ce qui existe là-bas.
+#
+#  L'identifiant utilisé est l'ID Discord de celui qui clique — c'est déjà la
+#  clé de partage côté Winsight comme côté Helios.
+
+CROSS_PLATFORM_TITLE = "🔀 Cross-Platform Access"
+CROSS_PLATFORM_DESCRIPTION = (
+    "Already own a weight on one platform and want it on another too? "
+    "Press the button below or use `/cross-platform-access` right here in this channel.\n\n"
+    "**How it works:**\n"
+    "1️⃣ Pick the platform you currently own it on\n"
+    "2️⃣ We'll automatically check what you own\n"
+    "3️⃣ Pick the platform you'd like access on\n"
+    "4️⃣ Everything you own gets added there right away\n\n"
+    "ℹ️ Your existing access isn't touched or removed — this only adds access elsewhere.\n\n"
+    "⚠️ Make sure your subscription is linked to **this** Discord account before starting."
+)
+
+
+async def get_owned_models(platform: str, discord_id: str) -> list[str]:
+    """
+    Modèles du catalogue que ce client possède sur `platform`.
+
+    On ne teste que les modèles présents dans products.json pour cette
+    plateforme : c'est le catalogue vendu, donc le seul périmètre pertinent.
+    """
+    products = load_products()
+    candidates = [m for m in products if platform in products.get(m, {})]
+    owned = []
+
+    for model_name in candidates:
+        if platform == "winsight":
+            try:
+                weight = await winsight.find_weight(model_name)
+            except WinsightError:
+                continue  # pas (encore) sur le portail, ou nom ambigu
+            if await winsight.has_share(weight["id"], discord_id):
+                owned.append(model_name)
+        else:
+            ok, _ = await helios_check(discord_id, model_name)
+            if ok:
+                owned.append(model_name)
+
+    return owned
+
+
+async def grant_model_on_platform(platform: str, discord_id: str, model_name: str) -> tuple[bool, str]:
+    if platform == "winsight":
+        return await winsight_grant(discord_id, model_name)
+    return await helios_grant(discord_id, model_name)
+
+
+def _platform_options(keys) -> list[discord.SelectOption]:
+    return [
+        discord.SelectOption(
+            label=PLATFORMS[k]["label"],
+            value=k,
+            emoji=PLATFORMS[k]["emoji"],
+        )
+        for k in keys
+    ]
+
+
+class CrossPlatformSourceSelect(discord.ui.Select):
+    """Étape 1 : où le client possède déjà le modèle."""
+
+    def __init__(self):
+        super().__init__(
+            placeholder="Platform you already own it on…",
+            options=_platform_options(PLATFORMS.keys()),
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        source = self.values[0]
+        discord_id = str(interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            owned = await get_owned_models(source, discord_id)
+        except Exception as e:
+            print(f"[CrossPlatform] Ownership check failed on {source}: {e}")
+            await interaction.followup.send(
+                f"❌ Couldn't reach **{platform_label(source)}** right now. Please try again in a moment.",
+                ephemeral=True,
+            )
+            return
+
+        if not owned:
+            await interaction.followup.send(
+                f"❌ We couldn't find any weight you own on **{platform_label(source)}** "
+                f"for this Discord account (`{discord_id}`).\n\n"
+                "Make sure your subscription is linked to this account, then try again. "
+                "If you're sure it should be there, open a ticket.",
+                ephemeral=True,
+            )
+            return
+
+        products = load_products()
+        targets = [
+            key for key in PLATFORMS
+            if key != source and any(key in products.get(m, {}) for m in owned)
+        ]
+
+        found = "\n".join(f"● **{get_display_name(m)}**" for m in owned)
+
+        if not targets:
+            await interaction.followup.send(
+                f"✅ You own **{len(owned)}** weight(s) on {platform_label(source)}:\n{found}\n\n"
+                "❌ None of them are available on another platform, so there's nothing to transfer.",
+                ephemeral=True,
+            )
+            return
+
+        view = discord.ui.View(timeout=300)
+        view.add_item(CrossPlatformTargetSelect(source, owned, targets))
+        await interaction.followup.send(
+            f"**Step 2 of 2** — Found **{len(owned)}** weight(s) on {platform_label(source)}:\n{found}\n\n"
+            "Where would you like access?",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class CrossPlatformTargetSelect(discord.ui.Select):
+    """Étape 2 : où le client veut l'accès."""
+
+    def __init__(self, source: str, owned: list[str], targets: list[str]):
+        self.source = source
+        self.owned = owned
+        super().__init__(
+            placeholder="Platform you want access on…",
+            options=_platform_options(targets),
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        target = self.values[0]
+        discord_id = str(interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        products = load_products()
+        todo = [m for m in self.owned if target in products.get(m, {})]
+
+        lines = []
+        nb_ok = 0
+        for model_name in todo:
+            ok, msg = await grant_model_on_platform(target, discord_id, model_name)
+            lines.append(f"{'✓' if ok else '✗'} **{get_display_name(model_name)}**")
+            if ok:
+                nb_ok += 1
+            else:
+                print(f"[CrossPlatform] Grant failed {model_name} on {target}: {msg}")
+
+        nb_fail = len(todo) - nb_ok
+        all_ok = nb_fail == 0 and nb_ok > 0
+
+        embed = discord.Embed(
+            title="✅ Access Added" if all_ok else ("⚠️ Partially Added" if nb_ok else "❌ Nothing Added"),
+            description=(
+                f"**{platform_label(self.source)}** → **{platform_label(target)}**\n\n"
+                + "\n".join(lines)
+            ),
+            color=0x57F287 if all_ok else (0xF1C40F if nb_ok else 0xED4245),
+        )
+        embed.add_field(name="Result", value=f"{nb_ok} added, {nb_fail} failed", inline=False)
+        if nb_ok:
+            embed.set_footer(text="Your access on the original platform is unchanged.")
+        if nb_fail:
+            embed.add_field(
+                name="Need help?",
+                value="Open a ticket and staff will sort out the rest manually.",
+                inline=False,
+            )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        staff = get_guild_channel(interaction.guild_id, "staff_channel_id")
+        if staff:
+            report = discord.Embed(
+                title="🔀 Cross-Platform Transfer",
+                description=f"**{platform_label(self.source)}** → **{platform_label(target)}**\n"
+                            + "\n".join(lines),
+                color=embed.color,
+            )
+            report.add_field(name="Customer", value=f"{interaction.user.mention} (`{discord_id}`)", inline=False)
+            report.add_field(name="Result", value=f"{nb_ok} added, {nb_fail} failed", inline=False)
+            try:
+                await staff.send(embed=report)
+            except Exception as e:
+                print(f"[CrossPlatform] Could not post staff report: {e}")
+
+
+async def start_cross_platform(interaction: discord.Interaction):
+    if not load_products():
+        await interaction.response.send_message(
+            "⚠️ No products are configured yet. Ask an admin to set them up.", ephemeral=True
+        )
+        return
+    view = discord.ui.View(timeout=300)
+    view.add_item(CrossPlatformSourceSelect())
+    await interaction.response.send_message(
+        "**Step 1 of 2** — Which platform do you currently own the weight on?",
+        view=view,
+        ephemeral=True,
+    )
+
+
+class CrossPlatformPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Cross-Platform Access",
+        emoji="🔀",
+        style=discord.ButtonStyle.primary,
+        custom_id="cross_platform_start",
+    )
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await start_cross_platform(interaction)
+
+
+@tree.command(name="cross-platform-access", description="Get a weight you own on another platform too")
+async def cross_platform_access_cmd(interaction: discord.Interaction):
+    await start_cross_platform(interaction)
+
+
+@tree.command(name="crossplatformpanel", description="Post the Cross-Platform Access panel in this channel")
+@app_commands.checks.has_permissions(administrator=True)
+async def crossplatformpanel_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title=CROSS_PLATFORM_TITLE,
+        description=CROSS_PLATFORM_DESCRIPTION,
+        color=0x5865F2,
+    )
+    platforms = " • ".join(f"{cfg['emoji']} {cfg['label']}" for cfg in PLATFORMS.values())
+    embed.add_field(name="Supported platforms", value=platforms, inline=False)
+    await interaction.channel.send(embed=embed, view=CrossPlatformPanelView())
+    await interaction.response.send_message("✅ Cross-platform panel posted!", ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  HELIOS RESOURCE MAPPING (admin)
+# ─────────────────────────────────────────────
+
+async def product_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete sur les noms de modèles exacts (pas les groupes de jeu)."""
+    matches = [n for n in load_products().keys() if current.lower() in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in matches[:25]]
+
+
+@tree.command(name="setheliosresource", description="Map a model to its Helios resource ID (UUID)")
+@app_commands.describe(
+    model="Exact model name (e.g. XyCubValorantV2)",
+    resource_id="The Helios item UUID for this model",
+)
+@app_commands.autocomplete(model=product_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def setheliosresource_cmd(interaction: discord.Interaction, model: str, resource_id: str):
+    resources = load_helios_resources()
+    resources[model.strip()] = resource_id.strip()
+    save_helios_resources(resources)
+    await interaction.response.send_message(
+        f"✅ **{get_display_name(model)}** (`{model}`) → Helios item `{resource_id.strip()}`.",
+        ephemeral=True,
+    )
+    await backup_config_to_discord("setheliosresource")
+
+
+@tree.command(name="removeheliosresource", description="Remove a model's Helios resource mapping")
+@app_commands.autocomplete(model=product_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def removeheliosresource_cmd(interaction: discord.Interaction, model: str):
+    resources = load_helios_resources()
+    if model not in resources:
+        await interaction.response.send_message(f"⚠️ No Helios mapping for **{model}**.", ephemeral=True)
+        return
+    del resources[model]
+    save_helios_resources(resources)
+    await interaction.response.send_message(f"🚫 Helios mapping removed for **{model}**.", ephemeral=True)
+    await backup_config_to_discord("removeheliosresource")
+
+
+@tree.command(name="heliosresources", description="List the model to Helios resource ID mappings")
+@app_commands.checks.has_permissions(administrator=True)
+async def heliosresources_cmd(interaction: discord.Interaction):
+    resources = load_helios_resources()
+    products = load_products()
+    on_helios = [m for m in products if "helios" in products.get(m, {})]
+    missing = [m for m in on_helios if m not in resources]
+
+    embed = discord.Embed(title="🎯 Helios Resource Mapping", color=EMBED_COLOR)
+    if resources:
+        embed.description = "\n".join(
+            f"● **{get_display_name(m)}** → `{rid}`" for m, rid in resources.items()
+        )
+    else:
+        embed.description = "No mappings yet. Use `/setheliosresource`."
+
+    if missing:
+        embed.add_field(
+            name="⚠️ Sold on Helios but unmapped",
+            value="\n".join(f"● {get_display_name(m)} (`{m}`)" for m in missing)
+                  + "\n\nThese fall back to the global `HELIOS_RESOURCE_ID`.",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ─────────────────────────────────────────────
 #  VOUCH
